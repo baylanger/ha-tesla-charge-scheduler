@@ -1,446 +1,507 @@
 alias: Scylla - Smart Charge Scheduler
-    from: home
-    id: reset
-    trigger: state
-  - entity_id: binary_sensor.scylla_charger
-    to: 'on'
-    id: plugged_in
-    trigger: state
+description: 'Schedules Tesla charging based on current battery %, target %, and
+  departure time. Handles voltage detection, battery protection, and post-charge
+  reset.
+
+  '
+triggers:
+- entity_id: number.scylla_charge_limit
+  id: schedule
+  trigger: state
+- entity_id: input_datetime.scylla_departure_time
+  id: schedule
+  trigger: state
+- entity_id: number.scylla_charging_amps
+  id: schedule
+  trigger: state
+- entity_id: input_number.scylla_set_charge_limit
+  id: schedule
+  trigger: state
+- at: '00:01:00'
+  id: schedule
+  trigger: time
+- at: '18:00:00'
+  id: update_departure
+  trigger: time
+- entity_id: sensor.scylla_usable_battery_level
+  id: schedule
+  trigger: state
+- entity_id: device_tracker.scylla_location
+  from: home
+  id: reset
+  trigger: state
+- entity_id: binary_sensor.scylla_charger
+  to: 'on'
+  id: plugged_in
+  trigger: state
 conditions: []
 actions:
-  - choose:
+- choose:
+  - conditions:
+    - condition: trigger
+      id: update_departure
+    - condition: template
+      value_template: "{{ states('input_number.scylla_target_range_km') | float(0)
+        == 0\n   and states('input_number.scylla_target_range_mi') | float(0) ==
+        0\n   and states('sensor.scylla_charging_state') | lower != 'charging'\n
+        \  and not is_state('binary_sensor.scylla_charging', 'on') }}\n"
+    sequence:
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.scylla_departure_time
+      data:
+        time: "{% set tomorrow = now().weekday() + 1 %} {% if tomorrow >= 5 %}\n
+          \ {{ default_departure_time_weekend }}\n{% else %}\n  {{ default_departure_time_weekday
+          }}\n{% endif %}\n"
+  - conditions:
+    - condition: trigger
+      id: plugged_in
+    sequence:
+    - action: homeassistant.update_entity
+      target:
+        entity_id: sensor.scylla_location_country_code
+    - wait_for_trigger:
+      - entity_id: sensor.scylla_location_country_code
+        trigger: state
+      timeout: '00:00:10'
+      continue_on_timeout: true
+    - variables:
+        country_code: '{{ states(''sensor.scylla_location_country_code'') | upper
+          }}
+
+          '
+        voltage_entry: '{% set map = state_attr(''sensor.ev_voltage_map'', ''map'')
+          %} {{ map.get(country_code, ''120,240'') if map else ''120,240'' }}
+
+          '
+        mapped_slow: '{{ voltage_entry.split('','')[0] | float(120) }}
+
+          '
+        mapped_fast: '{{ voltage_entry.split('','')[1] | float(240) }}
+
+          '
+        final_slow: '{{ voltage_override_slow if voltage_override_slow > 0 else
+          mapped_slow }}
+
+          '
+        final_fast: '{{ voltage_override_fast if voltage_override_fast > 0 else
+          mapped_fast }}
+
+          '
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.scylla_slow_voltage
+      data:
+        value: '{{ final_slow }}'
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.scylla_fast_voltage
+      data:
+        value: '{{ final_fast }}'
+    - choose:
       - conditions:
-          - condition: trigger
-            id: update_departure
+        - condition: template
+          value_template: '{{ is_state(''binary_sensor.scylla_charger'', ''off'')
+            }}
+
+            '
+        sequence:
+        - action: '{{ notification_target }}'
+          data:
+            message: 'Scylla is not connected to the charger. Please plug in before
+              scheduled charge time.
+
+              '
+  - conditions:
+    - condition: trigger
+      id: reset
+    - condition: template
+      value_template: '{{ is_state(''input_boolean.scylla_protection_charge_active'',
+        ''off'') }}
+
+        '
+    sequence:
+    - action: number.set_value
+      target:
+        entity_id: number.scylla_charge_limit
+      data:
+        value: '{{ default_target_pct }}'
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.scylla_set_charge_limit
+      data:
+        value: '{{ default_target_pct }}'
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.scylla_departure_time
+      data:
+        time: "{% if now().weekday() < 5 %}\n  {{ default_departure_time_weekday
+          }}\n{% else %}\n  {{ default_departure_time_weekend }}\n{% endif %}\n"
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.scylla_target_range_km
+      data:
+        value: 0
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.scylla_target_range_mi
+      data:
+        value: 0
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.scylla_set_charging_amps
+      data:
+        value: '{{ default_charging_amps }}'
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.scylla_default_charging_amps
+      data:
+        value: '{{ default_charging_amps }}'
+    - action: input_select.select_option
+      target:
+        entity_id: input_select.scylla_charging_speed
+      data:
+        option: Fast
+    - action: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.scylla_protection_charge_active
+  - conditions:
+    - condition: trigger
+      id: schedule
+    - condition: state
+      entity_id: binary_sensor.scylla_charger
+      state: 'on'
+    - condition: template
+      value_template: "{{ states('sensor.scylla_usable_battery_level_safe') | float(0)
+        > 0\n   and states('sensor.scylla_charging_amps') | float(0) > 0 }}\n"
+    sequence:
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.scylla_protection_low
+      data:
+        value: '{{ protection_limit_low_pct }}'
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.scylla_protection_mid
+      data:
+        value: '{{ protection_limit_mid_pct }}'
+    - action: "input_boolean.turn_{{ 'on' if enable_battery_protection else 'off' }}"
+      target:
+        entity_id: input_boolean.scylla_battery_protection_enabled
+    - variables:
+        current_pct: '{{ states(''sensor.scylla_usable_battery_level_safe'') | float(0)
+          }}
+
+          '
+        charge_limit_pct: '{{ states(''input_number.scylla_set_charge_limit'') |
+          float(default_target_pct) }}
+
+          '
+        current_range: "{% if range_unit == 'km' %}\n  {{ states('sensor.scylla_est_battery_range')
+          | float(0) }}\n{% else %}\n  {{ states('sensor.scylla_est_battery_range_mi')
+          | float(0) }}\n{% endif %}\n"
+        target_range_input: "{% if range_unit == 'km' %}\n  {{ states('input_number.scylla_target_range_km')
+          | float(0) }}\n{% else %}\n  {{ states('input_number.scylla_target_range_mi')
+          | float(0) }}\n{% endif %}\n"
+        range_based_pct: "{% if target_range_input > 0 and current_pct > 0 and current_range
+          > 0 %}\n  {% set full_range = current_range / (current_pct / 100) %}\n
+          \ {{ [(target_range_input / full_range * 100) | round(0) | int, 100] |
+          min }}\n{% else %}\n  {{ charge_limit_pct }}\n{% endif %}\n"
+        charge_target_pct: "{% set requested = range_based_pct | float %} {% if
+          enable_battery_protection %}\n  {% if requested <= 50 %}\n    {{ protection_limit_low_pct
+          }}\n  {% elif requested == 51 %}\n    {{ protection_limit_mid_pct }}\n
+          \ {% else %}\n    {{ requested }}\n  {% endif %}\n{% else %}\n  {{ requested
+          }}\n{% endif %}\n"
+        capacity: '{{ states(''input_number.scylla_battery_capacity_kwh'') | float(75)
+          }}
+
+          '
+        amps: '{{ states(''sensor.scylla_charging_amps'') | float(default_charging_amps) }}
+
+          '
+        slow_v: '{{ voltage_override_slow if voltage_override_slow > 0 else states(''input_number.scylla_slow_voltage'')
+          | float(120) }}
+
+          '
+        fast_v: '{{ voltage_override_fast if voltage_override_fast > 0 else states(''input_number.scylla_fast_voltage'')
+          | float(240) }}
+
+          '
+        min_per_pct_slow: '{{ ((capacity * 1000 * 0.01) / (slow_v * amps) * 60)
+          | round(1) }}
+
+          '
+        min_per_pct_fast: '{{ ((capacity * 1000 * 0.01) / (fast_v * amps) * 60)
+          | round(1) }}
+
+          '
+        charge_pct_needed: '{{ [charge_target_pct | float - current_pct, 0] | max
+          }}
+
+          '
+        below_protection_cap: "{% if enable_battery_protection %}\n  {% set hysteresis
+          = states('input_number.scylla_protection_hysteresis') | float(2) %}\n
+          \ {{ current_pct < (protection_limit_low_pct - hysteresis) }}\n{% else
+          %}\n  false\n{% endif %}\n"
+        total_minutes_slow: '{{ (charge_pct_needed * min_per_pct_slow) | int }}
+
+          '
+        total_minutes_fast: '{{ (charge_pct_needed * min_per_pct_fast) | int }}
+
+          '
+        departure_str: '{{ states(''input_datetime.scylla_departure_time'') }}
+
+          '
+        dep_seconds: '{% set t = departure_str.split('':'') %} {{ t[0]|int * 3600
+          + t[1]|int * 60 }}
+
+          '
+        total_minutes: '{{ total_minutes_fast }}'
+        start_seconds: '{% set s = dep_seconds | int - total_minutes_fast * 60 %}
+          {{ s if s >= 0 else s + 86400 }}
+
+          '
+        start_time: '{% set h = (start_seconds | int // 3600) % 24 %} {% set m =
+          (start_seconds | int % 3600) // 60 %} {{ ''%02d:%02d'' | format(h, m)
+          }}
+
+
+          '
+        h_slow: '{{ total_minutes_slow // 60 }}'
+        m_slow: '{{ total_minutes_slow % 60 }}'
+        h_fast: '{{ total_minutes_fast // 60 }}'
+        m_fast: '{{ total_minutes_fast % 60 }}'
+    - choose:
+      - conditions:
+        - condition: template
+          value_template: '{{ charge_pct_needed <= 0 }}'
+        sequence:
+        - stop: Already at target, no charging needed
+      - conditions:
+        - condition: template
+          value_template: "{{ states('sensor.scylla_charging_state') | lower ==
+            'charging'\n   or is_state('binary_sensor.scylla_charging', 'on') }}\n"
+        sequence:
+        - stop: Already charging, no action needed
+      - conditions:
+        - condition: template
+          value_template: '{{ below_protection_cap }}'
+        sequence:
+        - variables:
+            protection_minutes_fast: '{{ ((protection_limit_low_pct - current_pct)
+              * min_per_pct_fast) | round(0) | int }}
+
+              '
+            protection_finish_seconds: '{{ as_timestamp(now()) + protection_minutes_fast
+              * 60 }}
+
+              '
+            scheduled_start_seconds: '{% set s = dep_seconds | int - total_minutes_fast
+              * 60 %} {{ s if s >= 0 else s + 86400 }}
+
+              '
+        - choose:
+          - conditions:
+            - condition: template
+              value_template: '{{ protection_finish_seconds < (as_timestamp(now())
+                + scheduled_start_seconds) }}'
+            sequence:
+            - action: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.scylla_protection_charge_active
+            - action: '{{ notification_target }}'
+              data:
+                message: 'Scylla battery below protection cap ({{ current_pct |
+                  int }}% < {{ protection_limit_low_pct }}%). {% if charge_target_pct
+                  > protection_limit_low_pct %} Charging to {{ protection_limit_low_pct
+                  | int }}% now, then to {{ charge_target_pct | int }}% at {{ start_time
+                  }}. {% else %} Charging to {{ protection_limit_low_pct | int }}%
+                  now. {% endif %}
+
+                  '
+            - action: switch.turn_on
+              target:
+                entity_id: switch.scylla_charger
+          default:
+          - action: '{{ notification_target }}'
+            data:
+              message: 'Scylla battery below protection cap ({{ current_pct | int
+                }}% < {{ protection_limit_low_pct }}%). Not enough time to stop
+                at {{ protection_limit_low_pct | int }}% — charging straight to
+                {{ charge_target_pct | int }}%.
+
+                '
+          - action: switch.turn_on
+            target:
+              entity_id: switch.scylla_charger
+      - conditions:
+        - condition: template
+          value_template: '{{ total_minutes_fast * 60 > dep_seconds | int }}'
+        sequence:
+        - action: '{{ notification_target }}'
+          data:
+            message: 'Scylla needs {{ total_minutes_fast }} min to charge but departure
+              is too soon. Starting NOW. Fast ({{ fast_v | int }}V): {{ h_fast }}h
+              {{ m_fast }}min.
+
+              '
+        - action: switch.turn_on
+          target:
+            entity_id: switch.scylla_charger
+      default:
+      - choose:
+        - conditions:
           - condition: template
-            value_template: |
-              {{ states('input_number.scylla_target_range_km') | float(0) == 0
-                 and states('input_number.scylla_target_range_mi') | float(0) == 0
-                 and states('sensor.scylla_charging_state') | lower != 'charging'
-                 and not is_state('binary_sensor.scylla_charging', 'on') }}
-        sequence:
-          - action: input_datetime.set_datetime
-            target:
-              entity_id: input_datetime.scylla_departure_time
+            value_template: '{{ range_based_pct >= 100 }}'
+          sequence:
+          - action: '{{ notification_target }}'
             data:
-              time: |
-                {% set tomorrow = now().weekday() + 1 %} {% if tomorrow >= 5 %}
-                  {{ default_departure_time_weekend }}
-                {% else %}
-                  {{ default_departure_time_weekday }}
-                {% endif %}
-      - conditions:
-          - condition: trigger
-            id: plugged_in
-        sequence:
-          - action: homeassistant.update_entity
-            target:
-              entity_id: sensor.scylla_location_country_code
-          - wait_for_trigger:
-              - entity_id: sensor.scylla_location_country_code
-                trigger: state
-            timeout: '00:00:10'
-            continue_on_timeout: true
-          - variables:
-              country_code: |
-                {{ states('sensor.scylla_location_country_code') | upper }}
-              voltage_entry: >
-                {% set map = state_attr('sensor.ev_voltage_map', 'map') %} {{
-                map.get(country_code, '120,240') if map else '120,240' }}
-              mapped_slow: |
-                {{ voltage_entry.split(',')[0] | float(120) }}
-              mapped_fast: |
-                {{ voltage_entry.split(',')[1] | float(240) }}
-              final_slow: >
-                {{ voltage_override_slow if voltage_override_slow > 0 else
-                mapped_slow }}
-              final_fast: >
-                {{ voltage_override_fast if voltage_override_fast > 0 else
-                mapped_fast }}
-          - action: input_number.set_value
-            target:
-              entity_id: input_number.scylla_slow_voltage
+              message: 'Scylla requested range not achievable at current efficiency
+                — charging to 100%.
+
+                '
+      - variables:
+          now_seconds: '{{ now().hour * 3600 + now().minute * 60 + now().second
+            }}
+
+            '
+          departure_passed: '{% set dep_sec = dep_seconds | int %} {% set now_sec
+            = now_seconds | int %} {% set start_sec = start_seconds | int %} {#
+            Departure passed only if dep is earlier today AND start time was also
+            today (not cross-midnight) #} {{ dep_sec < now_sec and start_sec < now_sec
+            and start_sec <= dep_sec }}
+
+            '
+          start_time_past: "{% set start_sec = start_seconds | int %} {% set now_sec
+            = now_seconds | int %} {% set dep_sec = dep_seconds | int %} {% if dep_sec
+            > now_sec %}\n  {# Departure later today — start time past if it was
+            earlier today #}\n  {{ start_sec < now_sec }}\n{% else %}\n  {# Cross-midnight
+            — start time is past only if it's between now and midnight #}\n  {#
+            i.e. start was supposed to be tonight but we missed it #}\n  {{ start_sec
+            < now_sec and start_sec > dep_sec }}\n{% endif %}\n"
+      - choose:
+        - conditions:
+          - condition: template
+            value_template: '{{ departure_passed }}'
+          sequence:
+          - stop: Departure time already passed, skipping
+        - conditions:
+          - condition: template
+            value_template: '{{ start_time_past }}'
+          sequence:
+          - action: '{{ notification_target }}'
             data:
-              value: '{{ final_slow }}'
-          - action: input_number.set_value
+              message: 'Scylla scheduled start time ({{ start_time }}) already passed
+                — starting NOW. From {{ current_pct | int }}% to {{ charge_target_pct
+                | int }}%.
+
+                '
+          - action: switch.turn_on
             target:
-              entity_id: input_number.scylla_fast_voltage
+              entity_id: switch.scylla_charger
+        default:
+        - action: '{{ notification_target }}'
+          data:
+            message: "Scylla charge scheduled: start at {{ start_time }}. From {{
+              current_pct | int }}% to {{ charge_target_pct | int }}%. {% if slow_v
+              != fast_v %} \U0001F422 Slow ({{ slow_v | int }}V): {{ h_slow }}h
+              {{ m_slow }}min. ⚡ Fast ({{ fast_v | int }}V): {{ h_fast }}h {{ m_fast
+              }}min. {% else %} Duration: {{ h_fast }}h {{ m_fast }}min at {{ fast_v
+              | int }}V. {% endif %}\n"
+        - wait_for_trigger:
+          - at: '{{ start_time }}'
+            trigger: time
+      - choose:
+        - conditions:
+          - condition: template
+            value_template: '{{ is_state(''binary_sensor.scylla_charger'', ''off'')
+              }}
+
+              '
+          sequence:
+          - action: '{{ notification_target }}'
             data:
-              value: '{{ final_fast }}'
-          - choose:
-              - conditions:
-                  - condition: template
-                    value_template: |
-                      {{ is_state('binary_sensor.scylla_charger', 'off') }}
-                sequence:
-            value_template: >
-              {{ is_state('input_boolean.scylla_protection_charge_active',
-              'off') }}
-        sequence:
+              message: 'Scylla charge could not start — cable not connected. Please
+                plug in.
+
+                '
+        default:
+        - if:
+          - condition: template
+            value_template: "{{ states('sensor.scylla_charging_state') | lower ==
+              'charging'\n   or is_state('binary_sensor.scylla_charging', 'on')
+              }}\n"
+          then:
+          - action: '{{ notification_target }}'
+            data:
+              message: 'Scylla is already charging (started manually) — leaving
+                your amps/settings as-is.
+
+                '
+          - stop: Already charging when start time arrived — skipping amps push
+        - if:
+          - condition: state
+            entity_id: device_tracker.scylla_location
+            state: home
+          then:
           - action: number.set_value
             target:
-              entity_id: number.scylla_charge_limit
+              entity_id: number.scylla_charging_amps
             data:
-              value: '{{ default_target_pct }}'
-          - action: input_number.set_value
-            target:
-              entity_id: input_number.scylla_set_charge_limit
-            data:
-              value: '{{ default_target_pct }}'
-          - action: input_datetime.set_datetime
-            target:
-              entity_id: input_datetime.scylla_departure_time
-            data:
-              time: |
-                {% if now().weekday() < 5 %}
-                  {{ default_departure_time_weekday }}
-                {% else %}
-                  {{ default_departure_time_weekend }}
-                {% endif %}
-          - action: input_number.set_value
-            target:
-              entity_id: input_number.scylla_target_range_km
-            data:
-              value: 0
-          - action: input_number.set_value
-            target:
-              entity_id: input_number.scylla_target_range_mi
-            data:
-              value: 0
-          - action: input_number.set_value
-            target:
-              entity_id: input_number.scylla_set_charging_amps
-            data:
-              value: '{{ default_charging_amps }}'
-          - action: input_number.set_value
-            target:
-              entity_id: input_number.scylla_default_charging_amps
-            data:
-              value: '{{ default_charging_amps }}'
-          - action: input_select.select_option
-            target:
-              entity_id: input_select.scylla_charging_speed
-            data:
-              option: Fast
-          - action: input_boolean.turn_off
-            target:
-              entity_id: input_boolean.scylla_protection_charge_active
-      - conditions:
-          - condition: trigger
-            id: schedule
-          - condition: state
-            entity_id: binary_sensor.scylla_charger
-            state: 'on'
-          - condition: template
-            value_template: >
-              {{ states('sensor.scylla_usable_battery_level_safe') | float(0) >
-              0
-                 and states('sensor.scylla_charging_amps') | float(0) > 0 }}
-        sequence:
-          - action: input_number.set_value
-            target:
-              entity_id: input_number.scylla_protection_low
-            data:
-              value: '{{ protection_limit_low_pct }}'
-          - action: input_number.set_value
-            target:
-              entity_id: input_number.scylla_protection_mid
-            data:
-              value: '{{ protection_limit_mid_pct }}'
-          - action: >-
-              input_boolean.turn_{{ 'on' if enable_battery_protection else 'off'
-              }}
-            target:
-              entity_id: input_boolean.scylla_battery_protection_enabled
+              value: '{{ states(''input_number.scylla_set_charging_amps'') | int
+                }}'
+        - action: switch.turn_on
+          target:
+            entity_id: switch.scylla_charger
+        - wait_for_trigger:
+          - entity_id: sensor.scylla_charger_voltage
+            above: 75
+            trigger: numeric_state
+          timeout: '00:05:00'
+          continue_on_timeout: false
+        - choose:
+          - conditions:
+            - condition: template
+              value_template: '{{ wait.completed == false }}'
+            sequence:
+            - action: '{{ notification_target }}'
+              data:
+                message: 'Scylla charging may have failed to start — no voltage
+                  detected after 5 minutes. Please check the car.
+
+                  '
+          default:
+          - delay: '00:01:00'
           - variables:
-              current_pct: >
-                {{ states('sensor.scylla_usable_battery_level_safe') | float(0)
+              real_voltage: '{{ states(''sensor.scylla_charger_voltage'') | float(240)
                 }}
-              charge_limit_pct: >
-                {{ states('input_number.scylla_set_charge_limit') |
-                float(default_target_pct) }}
-              current_range: |
-                {% if range_unit == 'km' %}
-                  {{ states('sensor.scylla_est_battery_range') | float(0) }}
-                {% else %}
-                  {{ states('sensor.scylla_est_battery_range_mi') | float(0) }}
-                {% endif %}
-              target_range_input: |
-                {% if range_unit == 'km' %}
-                  {{ states('input_number.scylla_target_range_km') | float(0) }}
-                {% else %}
-                  {{ states('input_number.scylla_target_range_mi') | float(0) }}
-                {% endif %}
-              range_based_pct: >
-                {% if target_range_input > 0 and current_pct > 0 and
-                current_range > 0 %}
-                  {% set full_range = current_range / (current_pct / 100) %}
-                  {{ [(target_range_input / full_range * 100) | round(0) | int, 100] | min }}
-                {% else %}
-                  {{ charge_limit_pct }}
-                {% endif %}
-              charge_target_pct: >
-                {% set requested = range_based_pct | float %} {% if
-                enable_battery_protection %}
-                  {% if requested <= 50 %}
-                    {{ protection_limit_low_pct }}
-                  {% elif requested == 51 %}
-                    {{ protection_limit_mid_pct }}
-                  {% else %}
-                    {{ requested }}
-                  {% endif %}
-                {% else %}
-                  {{ requested }}
-                {% endif %}
-              capacity: >
-                {{ states('input_number.scylla_battery_capacity_kwh') |
-                float(75) }}
-              amps: >
-                {{ states('sensor.scylla_charging_amps') |
-                float(default_charging_amps) }}
-              slow_v: >
-                {{ voltage_override_slow if voltage_override_slow > 0 else
-                states('input_number.scylla_slow_voltage') | float(120) }}
-              fast_v: >
-                {{ voltage_override_fast if voltage_override_fast > 0 else
-                states('input_number.scylla_fast_voltage') | float(240) }}
-              min_per_pct_slow: >
-                {{ ((capacity * 1000 * 0.01) / (slow_v * amps) * 60) | round(1)
-                }}
-              min_per_pct_fast: >
-                {{ ((capacity * 1000 * 0.01) / (fast_v * amps) * 60) | round(1)
-                }}
-              charge_pct_needed: |
-                {{ [charge_target_pct | float - current_pct, 0] | max }}
-              below_protection_cap: |
-                {% if enable_battery_protection %}
-                  {% set hysteresis = states('input_number.scylla_protection_hysteresis') | float(2) %}
-                  {{ current_pct < (protection_limit_low_pct - hysteresis) }}
-                {% else %}
-                  false
-                {% endif %}
-              total_minutes_slow: |
-                {{ (charge_pct_needed * min_per_pct_slow) | int }}
-              total_minutes_fast: |
-                {{ (charge_pct_needed * min_per_pct_fast) | int }}
-              departure_str: |
-                {{ states('input_datetime.scylla_departure_time') }}
-              dep_seconds: >
-                {% set t = departure_str.split(':') %} {{ t[0]|int * 3600 +
-                t[1]|int * 60 }}
-              total_minutes: '{{ total_minutes_fast }}'
-              start_seconds: >
-                {% set s = dep_seconds | int - total_minutes_fast * 60 %} {{ s
-                if s >= 0 else s + 86400 }}
-              start_time: >+
-                {% set h = (start_seconds | int // 3600) % 24 %} {% set m =
-                (start_seconds | int % 3600) // 60 %} {{ '%02d:%02d' | format(h,
-                m) }}
 
+                '
+              real_amps: '{{ states(''number.scylla_charging_amps'') | float(default_charging_amps)
+                }}
 
-              h_slow: '{{ total_minutes_slow // 60 }}'
-              m_slow: '{{ total_minutes_slow % 60 }}'
-              h_fast: '{{ total_minutes_fast // 60 }}'
-              m_fast: '{{ total_minutes_fast % 60 }}'
-          - choose:
-              - conditions:
-                  - condition: template
-                    value_template: '{{ charge_pct_needed <= 0 }}'
-                sequence:
-                  - stop: Already at target, no charging needed
-              - conditions:
-                  - condition: template
-                    value_template: >
-                      {{ states('sensor.scylla_charging_state') | lower ==
-                      'charging'
-                         or is_state('binary_sensor.scylla_charging', 'on') }}
-                sequence:
-                  - stop: Already charging, no action needed
-              - conditions:
-                  - condition: template
-                    value_template: '{{ below_protection_cap }}'
-                sequence:
-                  - variables:
-                      protection_minutes_fast: >
-                        {{ ((protection_limit_low_pct - current_pct) *
-                        min_per_pct_fast) | round(0) | int }}
-                                at {{ start_time }}. {% else %} Charging to {{
-                                protection_limit_low_pct | int }}% now. {% endif
-                                %}
-                          - action: switch.turn_on
-                            target:
-                              entity_id: switch.scylla_charger
-                    default:
-                      - action: '{{ notification_target }}'
-                        data:
-                          message: >
-                            Scylla battery below protection cap ({{ current_pct
-                            | int }}% < {{ protection_limit_low_pct }}%). Not
-                            enough time to stop at {{ protection_limit_low_pct |
-                            int }}% — charging straight to {{ charge_target_pct
-                            | int }}%.
-                      - action: switch.turn_on
-                        target:
-                          entity_id: switch.scylla_charger
-              - conditions:
-                  - condition: template
-                    value_template: '{{ total_minutes_fast * 60 > dep_seconds | int }}'
-                sequence:
-                  - action: '{{ notification_target }}'
-                    data:
-                      message: >
-                        Scylla needs {{ total_minutes_fast }} min to charge but
-                        departure is too soon. Starting NOW. Fast ({{ fast_v |
-                        int }}V): {{ h_fast }}h {{ m_fast }}min.
-                  - action: switch.turn_on
-                    target:
-                      entity_id: switch.scylla_charger
-            default:
-              - choose:
-                  - conditions:
-                      - condition: template
-                        value_template: '{{ range_based_pct >= 100 }}'
-                    sequence:
-                      - action: '{{ notification_target }}'
-                        data:
-                          message: >
-                            Scylla requested range not achievable at current
-                            efficiency — charging to 100%.
-              - variables:
-                  now_seconds: |
-                    {{ now().hour * 3600 + now().minute * 60 + now().second }}
-                  departure_passed: >
-                    {% set dep_sec = dep_seconds | int %} {% set now_sec =
-                    now_seconds | int %} {% set start_sec = start_seconds | int
-                    %} {# Departure passed only if dep is earlier today AND
-                    start time was also today (not cross-midnight) #} {{ dep_sec
-                    < now_sec and start_sec < now_sec and start_sec <= dep_sec
-                    }}
-                  start_time_past: >
-                    {% set start_sec = start_seconds | int %} {% set now_sec =
-                    now_seconds | int %} {% set dep_sec = dep_seconds | int %}
-                    {% if dep_sec > now_sec %}
-                      {# Departure later today — start time past if it was earlier today #}
-                      {{ start_sec < now_sec }}
-                    {% else %}
-                      {# Cross-midnight — start time is past only if it's between now and midnight #}
-                      {# i.e. start was supposed to be tonight but we missed it #}
-                      {{ start_sec < now_sec and start_sec > dep_sec }}
-                    {% endif %}
-              - choose:
-                  - conditions:
-                      - condition: template
-                        value_template: '{{ departure_passed }}'
-                    sequence:
-                      - stop: Departure time already passed, skipping
-                  - conditions:
-                      - condition: template
-                        value_template: '{{ start_time_past }}'
-                    sequence:
-                      - action: '{{ notification_target }}'
-                        data:
-                        target:
-                          entity_id: switch.scylla_charger
-                default:
-                  - action: '{{ notification_target }}'
-                    data:
-                      message: >
-                        Scylla charge scheduled: start at {{ start_time }}. From
-                        {{ current_pct | int }}% to {{ charge_target_pct | int
-                        }}%. {% if slow_v != fast_v %} 🐢 Slow ({{ slow_v | int
-                        }}V): {{ h_slow }}h {{ m_slow }}min. ⚡ Fast ({{ fast_v |
-                        int }}V): {{ h_fast }}h {{ m_fast }}min. {% else %}
-                        Duration: {{ h_fast }}h {{ m_fast }}min at {{ fast_v |
-                        int }}V. {% endif %}
-                  - wait_for_trigger:
-                      - at: '{{ start_time }}'
-                        trigger: time
-              - choose:
-                  - conditions:
-                      - condition: template
-                        value_template: |
-                          {{ is_state('binary_sensor.scylla_charger', 'off') }}
-                    sequence:
-                      - action: '{{ notification_target }}'
-                        data:
-                          message: >
-                            Scylla charge could not start — cable not connected.
-                            Please plug in.
-                default:
-                  - if:
-                      - condition: template
-                        value_template: >
-                          {{ states('sensor.scylla_charging_state') | lower ==
-                          'charging'
-                             or is_state('binary_sensor.scylla_charging', 'on') }}
-                    then:
-                      - action: '{{ notification_target }}'
-                        data:
-                          message: >
-                            Scylla is already charging (started manually) —
-                            leaving your amps/settings as-is.
-                      - stop: >-
-                          Already charging when start time arrived — skipping
-                          amps push
-                  - if:
-                      - condition: state
-                        entity_id: device_tracker.scylla_location
-                        state: home
-                    then:
-                      - action: number.set_value
-                        target:
-                          entity_id: number.scylla_charging_amps
-                        data:
-                          value: >-
-                            {{ states('input_number.scylla_set_charging_amps') |
-                            int }}
-                  - action: switch.turn_on
-                    target:
-                      entity_id: switch.scylla_charger
-                  - wait_for_trigger:
-                      - entity_id: sensor.scylla_charger_voltage
-                        above: 75
-                        trigger: numeric_state
-                    timeout: '00:05:00'
-                    continue_on_timeout: false
-                  - choose:
-                      - conditions:
-                          - condition: template
-                            value_template: '{{ wait.completed == false }}'
-                        sequence:
-                          - action: '{{ notification_target }}'
-                            data:
-                              message: >
-                                Scylla charging may have failed to start — no
-                                voltage detected after 5 minutes. Please check
-                                the car.
-                    default:
-                      - delay: '00:01:00'
-                      - variables:
-                          real_voltage: >
-                            {{ states('sensor.scylla_charger_voltage') |
-                            float(240) }}
-                          real_amps: >
-                            {{ states('number.scylla_charging_amps') |
-                            float(default_charging_amps) }}
-                          real_phases: >
-                            {{ states('sensor.scylla_charger_phases') | int(1)
-                            }}
-                          car_est_hours: >
-                            {{ states('sensor.scylla_time_to_full_charge') |
-                            float(0) }}
-                          car_est_minutes: |
-                            {{ (car_est_hours * 60) | round(0) | int }}
-                          car_est_h: '{{ car_est_minutes // 60 }}'
-                          car_est_m: '{{ car_est_minutes % 60 }}'
-                      - action: '{{ notification_target }}'
-                        data:
-                          message: >
-                            Scylla charging started. {{ real_voltage | int }}V ·
-                            {{ real_amps | int }}A · {{ real_phases }} phase{%
-                            if real_phases > 1 %}s{% endif %}. Car estimates: {{
-                            car_est_h }}h {{ car_est_m }}min to reach {{
-                            charge_target_pct | int }}%.
+                '
+              real_phases: '{{ states(''sensor.scylla_charger_phases'') | int(1)
+                }}
+
+                '
+              car_est_hours: '{{ states(''sensor.scylla_time_to_full_charge'') |
+                float(0) }}
+
+                '
+              car_est_minutes: '{{ (car_est_hours * 60) | round(0) | int }}
+
+                '
+              car_est_h: '{{ car_est_minutes // 60 }}'
+              car_est_m: '{{ car_est_minutes % 60 }}'
+          - action: '{{ notification_target }}'
+            data:
+              message: 'Scylla charging started. {{ real_voltage | int }}V · {{
+                real_amps | int }}A · {{ real_phases }} phase{% if real_phases >
+                1 %}s{% endif %}. Car estimates: {{ car_est_h }}h {{ car_est_m }}min
+                to reach {{ charge_target_pct | int }}%.
+
+                '
 trace:
   stored_traces: 40
 mode: restart
