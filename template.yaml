@@ -21,6 +21,7 @@
     availability: "{{ has_value('sensor.scylla_speed') }}"
     state: "{{ states('sensor.scylla_speed') | float(0) > 0 }}"
 
+- sensor:
   - name: Scylla Minute to Full Charge
     unit_of_measurement: m
     icon: mdi:clock-outline
