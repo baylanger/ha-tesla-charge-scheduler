@@ -1,7 +1,26 @@
 # ─────────────────────────────────────────────
 # TESLA SCYLLA
 # ─────────────────────────────────────────────
-- sensor:
+
+#- binary_sensor:
+#  - name: Scylla Parking Brake
+#    default_entity_id: binary_sensor.scylla_park_brake
+#    icon: mdi:car-brake-parking
+#    state: >-
+#     {% if is_state('sensor.scylla_shift_state', 'P') %}
+#       ON
+#     {% else %}
+#       OFF
+#     {% endif %}
+
+- binary_sensor:
+  - name: Scylla Driving
+    unique_id: scylla_driving
+    default_entity_id: binary_sensor.scylla_driving
+    device_class: moving
+    availability: "{{ has_value('sensor.scylla_speed') }}"
+    state: "{{ states('sensor.scylla_speed') | float(0) > 0 }}"
+
   - name: Scylla Minute to Full Charge
     unit_of_measurement: m
     icon: mdi:clock-outline
