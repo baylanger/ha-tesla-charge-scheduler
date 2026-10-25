@@ -63,12 +63,12 @@ A smart Tesla charging automation for Home Assistant: it charges for your depart
   - `number.scylla_charging_amps`
   - `switch.scylla_charger`
   - `button.scylla_wake_up` (daily wake check; set `daily_wake_check: false` if you don't have it)
-  - `binary_sensor.scylla_charger` (cable connected)
+  - `binary_sensor.scylla_plugged_in` (cable connected, from TeslaMate MQTT; it updates right away, unlike the former `binary_sensor.scylla_charger` of the Tesla integration)
   - `sensor.scylla_charging_state` (TeslaMate: Charging, Complete, Stopped, Disconnected, NoPower, Starting)
   - `sensor.scylla_state` (online / asleep / offline…)
   - `sensor.scylla_charger_voltage`, `sensor.scylla_charger_phases`, `sensor.scylla_charger_actual_current`
   - `sensor.scylla_time_to_full_charge`
-  - `sensor.scylla_est_battery_range` (TeslaMate MQTT, always in km; `template.yaml` derives the miles version)
+  - `sensor.scylla_est_battery_range` and `sensor.scylla_rated_battery_range` (TeslaMate MQTT, always in km; `template.yaml` derives the miles version). Since Tesla firmware 2026.14.x the car may stop reporting the *estimated* range ([TeslaMate issue #5298](https://github.com/teslamate-org/teslamate/issues/5298)); the rated range is then used
   - `device_tracker.scylla_location` (`home`, a zone name or `not_home`, plus the latitude/longitude used for voltage detection)
   - `update.scylla_software_update`
 - OpenStreetMap Nominatim REST sensor (see `rest.yaml`)
@@ -128,6 +128,7 @@ Add the contents of `template.yaml` to `/config/template.yaml` (merge if you alr
 - `binary_sensor.scylla_at_charging_location` — on at one of your charging locations (3-minute delay before turning off)
 - `sensor.scylla_usable_battery_level_safe` — always-available battery %; falls back to `input_number.scylla_last_known_battery` when the car sleeps
 - `sensor.scylla_est_battery_range_mi` — estimated range in miles, converted from the km sensor
+- `sensor.scylla_effective_range` (km) and `sensor.scylla_effective_range_mi` — the range the scheduler really uses: the estimated range, or the rated range × `scylla_rated_range_factor` when the estimated range isn't reported (see *Target range*)
 - `sensor.scylla_charging_amps` — the car's amps while charging, otherwise the planned amps
 - `sensor.scylla_charge_target_pct` — the target: the target % after protection (50 → 42, 51 → 47), or what the target range needs if that's higher
 - `sensor.scylla_charger_1percent_increase_time` — minutes per 1% (voltage × amps × phases × efficiency − overhead)
@@ -162,6 +163,7 @@ Hand-tuned helpers have no `initial:` (an `initial:` would reset them at every r
 | Scylla battery capacity (kWh) | your usable capacity (Model 3 LR: 75) |
 | Scylla charging efficiency | 94 |
 | Scylla charging overhead (W) | 250 (see *Battery capacity and efficiency*) |
+| Scylla rated range factor | 85 (see *Target range*; a new helper starts at 50) |
 | Scylla amps sanity max | your charger's maximum (40 for a 48 A charger limited to 40 A) |
 | Scylla charging locations | `home` (add zones, comma-separated: `home, Chalet`) |
 | Scylla set charge limit | 50 (or your usual target) |
@@ -370,7 +372,7 @@ An update that finishes while no charge was paused does nothing.
 
 ### Target range
 
-The target range is a minimum for your next departure, converted to the % it needs from the car's current range per % (estimated range ÷ battery %). The target is the higher of that and the target % slider:
+The target range is a minimum for your next departure, converted to the % it needs from the car's current range per % (`sensor.scylla_effective_range` ÷ battery %). The target is the higher of that and the target % slider:
 
 | Target % | Target range | Charges to |
 |---|---|---|
@@ -378,6 +380,8 @@ The target range is a minimum for your next departure, converted to the % it nee
 | 55% | 350 km (needs ~72%) | 72% |
 | 50% (protection) | 30 km | protection only (40–42%) |
 | 50% (protection) | 280 km (needs ~58%) | 58% at departure |
+
+**Which range?** `sensor.scylla_effective_range` is the car's *estimated* range when it reports one. Tesla firmware 2026.14.x stopped sending it (TeslaMate shows the sensor as unknown), so otherwise it is the **rated** range × `scylla_rated_range_factor`. The rated range is higher than what you really get (cold, highway), so the factor scales it down: at 85%, a rated 560 km counts as ~476 km. Tune it from experience: if the car arrives with less range than you asked for, lower it; with much more, raise it. Too low is the safe side (it charges more). The sensor's `source` attribute shows which one is in use.
 
 Setting a range never changes the target % slider. A range above a full battery charges to 100% and sends a warning.
 
@@ -429,6 +433,7 @@ The card shows (in order):
 | `scylla_battery_capacity_kwh` | Battery size for time calculations | — |
 | `scylla_charge_efficiency` | Efficiency of the charging chain, applies to every speed (%, start at 94) | — |
 | `scylla_charge_overhead_w` | Fixed power the car uses while charging (W, start at 250): matters for slow charges | — |
+| `scylla_rated_range_factor` | Share of the rated range you really get (%, start at 85); used only while the estimated range isn't reported | — |
 | `scylla_target_range_km` / `_mi` | Minimum range for the next departure (0 = none); raises the target if needed, never lowers it | — |
 | `scylla_slow_voltage` | Slow voltage, 100–120 V, set from GPS | — |
 | `scylla_fast_voltage` | Fast voltage, 200–400 V, set from GPS | — |
@@ -518,7 +523,7 @@ Stopping at the protection cap and the reset after the departure time are silent
 **Car not starting charge**
 - Check the traces: Settings → Automations → Scylla - Smart Charge Scheduler → Traces, and Settings → Scripts → Scylla - Start Charge → Traces
 - Verify `switch.scylla_charger` exists and can be controlled
-- The car must be plugged in — `binary_sensor.scylla_charger` must be `on`
+- The car must be plugged in — `binary_sensor.scylla_plugged_in` must be `on`
 
 **Car charges past 42% during protection**
 - The helper stops at the cap only at a charging location — check `binary_sensor.scylla_at_charging_location`
@@ -538,7 +543,8 @@ Stopping at the protection cap and the reset after the departure time are silent
 - Use `voltage_override_slow` / `voltage_override_fast` in the scheduler to hardcode values
 
 **Range shows unknown, or a range target is ignored**
-- Check that `sensor.scylla_est_battery_range` exists and is in km (miles users: also `sensor.scylla_est_battery_range_mi`) in Developer Tools → States
+- `sensor.scylla_effective_range` should have a value; its `source` attribute says `estimated` or `rated × factor`. If it is unavailable, neither `sensor.scylla_est_battery_range` nor `sensor.scylla_rated_battery_range` has a value: check both in Developer Tools → States (they must be in km)
+- `sensor.scylla_est_battery_range` unknown since a car software update is normal (TeslaMate issue #5298): the rated range is used instead; check `scylla_rated_range_factor`
 - A template sensor keeps the entity ID it was first registered with, even if you later change its `name`. If an old entry such as `sensor.scylla_estimated_range_mi` exists, rename it in Settings → Entities (or delete it and restart)
 
 **Schedule skipped while the car sleeps or after a restart**

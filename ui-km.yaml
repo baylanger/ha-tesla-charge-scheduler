@@ -9,7 +9,7 @@ cards:
   - type: markdown
     content: >
       {% set charging_state = states('sensor.scylla_charging_state') | lower %}
-      {% set is_connected = is_state('binary_sensor.scylla_charger', 'on') %}
+      {% set is_connected = is_state('binary_sensor.scylla_plugged_in', 'on') %}
       {% set is_charging = charging_state in ['charging', 'starting'] %}
       {% set protection_only = state_attr('sensor.scylla_charge_target_pct', 'protection_only') | default(false, true) %}
       {% set protection_on = is_state('input_boolean.scylla_battery_protection_enabled', 'on') %}
@@ -47,7 +47,7 @@ cards:
       - entity: input_number.scylla_set_charge_limit
         name: Set target %
         mode: box
-      - entity: sensor.scylla_est_battery_range
+      - entity: sensor.scylla_effective_range
         name: Current range (km)
       - entity: input_number.scylla_target_range_km
         name: Set target range (km)

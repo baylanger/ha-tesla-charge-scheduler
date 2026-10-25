@@ -68,7 +68,7 @@
       state: >
         {{ (states('sensor.scylla_est_battery_range') | float(0) / 1.609344) | round(1) }}
 
-    # Optional extras (not used by the scheduler). Confirm sensor.scylla_rated_battery_range and
+    # Optional extras (the rated range is used by Scylla Effective Range below). Confirm sensor.scylla_rated_battery_range and
     # sensor.scylla_ideal_battery_range exist in Developer Tools → States.
     - name: Scylla Rated Battery Range Mi
       unique_id: scylla_rated_battery_range_mi
@@ -85,6 +85,45 @@
       availability: "{{ states('sensor.scylla_ideal_battery_range') | is_number }}"
       state: >
         {{ (states('sensor.scylla_ideal_battery_range') | float(0) / 1.609344) | round(1) }}
+
+    # ── Range used by the scheduler (km) ────────────────────────────────────
+    # The scheduler converts a target range (km / mi) into a battery % from the
+    # car's range per %. Tesla firmware 2026.14.x stopped sending the
+    # ESTIMATED range (TeslaMate issue #5298: sensor.scylla_est_battery_range
+    # stays unknown), so:
+    #   • estimated range, when the car still reports it (> 0);
+    #   • otherwise the RATED range × scylla_rated_range_factor, because the
+    #     rated range is higher than what you really get (cold, highway).
+    # The attribute `source` says which one is in use.
+    # (No device_class: with `distance` HA would convert the value to the
+    # unit system of your instance, and the km / mi sensors would no longer
+    # match their names.)
+    - name: Scylla Effective Range
+      unique_id: scylla_effective_range
+      unit_of_measurement: km
+      state_class: measurement
+      icon: mdi:gauge
+      availability: >
+        {{ states('sensor.scylla_est_battery_range') | float(0) > 0
+           or states('sensor.scylla_rated_battery_range') | float(0) > 0 }}
+      state: >
+        {% set est = states('sensor.scylla_est_battery_range') | float(0) %}
+        {% set rated = states('sensor.scylla_rated_battery_range') | float(0) %}
+        {% set factor = states('input_number.scylla_rated_range_factor') | float(85) / 100 %}
+        {{ (est if est > 0 else rated * factor) | round(1) }}
+      attributes:
+        source: >
+          {{ 'estimated' if states('sensor.scylla_est_battery_range') | float(0) > 0
+             else 'rated × factor' }}
+
+    # Same in miles (the conversion is a plain division: the sensors are km).
+    - name: Scylla Effective Range Mi
+      unique_id: scylla_effective_range_mi
+      unit_of_measurement: mi
+      state_class: measurement
+      icon: mdi:gauge
+      availability: "{{ states('sensor.scylla_effective_range') | is_number }}"
+      state: "{{ (states('sensor.scylla_effective_range') | float(0) / 1.609344) | round(1) }}"
 
 # These sensors to be added for our Tesla Smart Charge automation
 - sensor:
@@ -221,7 +260,8 @@
     #   1. The target % slider, after battery protection:
     #        50% → protection low cap (42%), 51% → protection mid cap (47%)
     #   2. The target range (km or mi), converted to the % it needs from the
-    #      car's current range per % (range ÷ battery %), max 100%.
+    #      car's current range per % (range ÷ battery %), max 100%. The range
+    #        is sensor.scylla_effective_range (estimated, or rated × factor).
     #   Target = the HIGHER of the two. The range is a minimum: it can raise
     #   the target, never lower it — 55% with a 30 km range stays 55%.
     # Attributes (read by the scheduler, the helper and the card):
@@ -244,8 +284,8 @@
         {% set target_mi = states('input_number.scylla_target_range_mi') | float(0) %}
         {% set km = target_km > 0 %}
         {% set target_range = target_km if km else target_mi %}
-        {% set current_range = states('sensor.scylla_est_battery_range' if km
-                                      else 'sensor.scylla_est_battery_range_mi') | float(0) %}
+        {% set current_range = states('sensor.scylla_effective_range' if km
+                                      else 'sensor.scylla_effective_range_mi') | float(0) %}
         {% set pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
         {% set range_pct = ([(target_range / (current_range / (pct / 100)) * 100) | round(0, 'ceil') | int, 100] | min)
                            if (target_range > 0 and pct > 0 and current_range > 0) else 0 %}
@@ -263,8 +303,8 @@
           {% set target_mi = states('input_number.scylla_target_range_mi') | float(0) %}
           {% set km = target_km > 0 %}
           {% set target_range = target_km if km else target_mi %}
-          {% set current_range = states('sensor.scylla_est_battery_range' if km
-                                      else 'sensor.scylla_est_battery_range_mi') | float(0) %}
+          {% set current_range = states('sensor.scylla_effective_range' if km
+                                      else 'sensor.scylla_effective_range_mi') | float(0) %}
           {% set pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
           {% set range_pct = ([(target_range / (current_range / (pct / 100)) * 100) | round(0, 'ceil') | int, 100] | min)
                            if (target_range > 0 and pct > 0 and current_range > 0) else 0 %}
@@ -274,8 +314,8 @@
           {% set target_mi = states('input_number.scylla_target_range_mi') | float(0) %}
           {% set km = target_km > 0 %}
           {% set target_range = target_km if km else target_mi %}
-          {% set current_range = states('sensor.scylla_est_battery_range' if km
-                                      else 'sensor.scylla_est_battery_range_mi') | float(0) %}
+          {% set current_range = states('sensor.scylla_effective_range' if km
+                                      else 'sensor.scylla_effective_range_mi') | float(0) %}
           {% set pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
           {{ ((target_range / (current_range / (pct / 100)) * 100) | round(0, 'ceil') | int)
              if (target_range > 0 and pct > 0 and current_range > 0) else 0 }}
@@ -289,8 +329,8 @@
           {% set target_mi = states('input_number.scylla_target_range_mi') | float(0) %}
           {% set km = target_km > 0 %}
           {% set target_range = target_km if km else target_mi %}
-          {% set current_range = states('sensor.scylla_est_battery_range' if km
-                                      else 'sensor.scylla_est_battery_range_mi') | float(0) %}
+          {% set current_range = states('sensor.scylla_effective_range' if km
+                                      else 'sensor.scylla_effective_range_mi') | float(0) %}
           {% set pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
           {% set range_pct = ([(target_range / (current_range / (pct / 100)) * 100) | round(0, 'ceil') | int, 100] | min)
                            if (target_range > 0 and pct > 0 and current_range > 0) else 0 %}
@@ -371,7 +411,7 @@
       unit_of_measurement: "%"
       state: >
         {% set current_pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
-        {% set est_range = states('sensor.scylla_est_battery_range') | float(0) %}
+        {% set est_range = states('sensor.scylla_effective_range') | float(0) %}
         {% set distance = state_attr('sensor.waze_scylla_to_home', 'distance') | float(0) %}
         {% if current_pct > 0 and est_range > 0 and distance > 0
               and not is_state('device_tracker.scylla_location', 'home') %}

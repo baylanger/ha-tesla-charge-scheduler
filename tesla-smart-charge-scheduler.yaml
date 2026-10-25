@@ -110,7 +110,7 @@ triggers:
 
   # ── Cable plugged in → detect voltage, then re-plan (with notification) ────
   - trigger: state
-    entity_id: binary_sensor.scylla_charger
+    entity_id: binary_sensor.scylla_plugged_in
     from: 'off'
     to: 'on'
     id: plugged_in
@@ -128,7 +128,7 @@ triggers:
 
   # ── Cable unplugged → forget a pending protection-run flag ─────────────────
   - trigger: state
-    entity_id: binary_sensor.scylla_charger
+    entity_id: binary_sensor.scylla_plugged_in
     from: 'on'
     to: 'off'
     id: unplugged
@@ -473,7 +473,7 @@ actions:
             value_template: >
               {{ daily_wake_check
                  and is_state('binary_sensor.scylla_at_charging_location', 'on')
-                 and is_state('binary_sensor.scylla_charger', 'on')
+                 and is_state('binary_sensor.scylla_plugged_in', 'on')
                  and states('sensor.scylla_state') in ['asleep', 'offline', 'suspended'] }}
         sequence:
           - action: button.press
@@ -526,7 +526,7 @@ actions:
       - alias: Compute the plan
         variables:
           at_location: "{{ is_state('binary_sensor.scylla_at_charging_location', 'on') }}"
-          plugged: "{{ is_state('binary_sensor.scylla_charger', 'on') }}"
+          plugged: "{{ is_state('binary_sensor.scylla_plugged_in', 'on') }}"
           # Only TeslaMate's charging_state is trusted: binary_sensor.scylla_charging
           # can stay "on" long after a charge has stopped.
           charging: "{{ states('sensor.scylla_charging_state') | lower in ['charging', 'starting'] }}"
@@ -542,7 +542,7 @@ actions:
           # TeslaMate restart) is a car that was already charging: not "self".
           plug_age: >
             {{ (as_timestamp(now())
-                - as_timestamp(states.binary_sensor.scylla_charger.last_changed)) if plugged else 0 }}
+                - as_timestamp(states.binary_sensor.scylla_plugged_in.last_changed)) if plugged else 0 }}
           self_started: >
             {{ charging and plug_age < 300
                and ((trigger.id == 'charging_started'

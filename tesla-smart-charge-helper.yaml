@@ -156,7 +156,7 @@ actions:
   - variables:
       at_location: "{{ is_state('binary_sensor.scylla_at_charging_location', 'on') }}"
       location: "{{ states('device_tracker.scylla_location') | lower | trim }}"
-      plugged: "{{ is_state('binary_sensor.scylla_charger', 'on') }}"
+      plugged: "{{ is_state('binary_sensor.scylla_plugged_in', 'on') }}"
       # Only charging_state is trusted (binary_sensor.scylla_charging can stay
       # "on" for hours after a charge stopped).
       charging: "{{ states('sensor.scylla_charging_state') | lower in ['charging', 'starting'] }}"
@@ -482,7 +482,7 @@ actions:
               # the amps it remembers for this place (often 32 A at home)
               just_plugged: >
                 {{ plugged and (as_timestamp(now())
-                    - as_timestamp(states.binary_sensor.scylla_charger.last_changed)) < 180 }}
+                    - as_timestamp(states.binary_sensor.scylla_plugged_in.last_changed)) < 180 }}
               # Car just woke up (was unknown/unavailable)
               woke_up: >
                 {{ trigger.from_state is not none
