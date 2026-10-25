@@ -1,15 +1,31 @@
-# Set when charging for battery protection
-# Prevents reset from firing and controls stop logic
+# ON during a battery-protection charge (battery fell below ~40%). The helper
+# stops the charge at the cap while this is on: 42% (or 47% for a 51% target),
+# and 42% when a higher target is waiting for its planned start (that planned
+# start then charges to the target). Having the flag means you can raise the
+# target in the middle of a protection charge and it still stops at the cap.
+# Turned on by script.scylla_start_charge (or by the scheduler when the car
+# starts by itself below the cap); turned off when the cap is reached, when
+# the full charge takes over, at unplug and when leaving a charging location.
+# No `initial:` so a protection run in progress survives an HA restart.
 scylla_protection_charge_active:
   name: "Scylla protection charge active"
-  initial: false
   icon: mdi:battery-lock
 
-# Set when a software update paused charging — update_finished only resumes
-# charging when this is on, so a restart or unrelated update can't start a charge
+# ON from the departure time until the car has reached its target and the
+# scheduler has reset the trip settings (target %, range, departure) to the
+# defaults. It means "the departure passed but the car is still at home and
+# hasn't reached its target yet". Cleared by a new target, range or departure
+# time, when the car leaves, and after the reset.
+# No `initial:` so it survives an HA restart.
+scylla_departure_passed:
+  name: "Scylla departure passed"
+  icon: mdi:clock-check-outline
+
+# ON when a software update paused a charge — update_finished only resumes
+# charging when this is on, so an unrelated update can't start a charge.
+# No `initial:` so a paused charge is still resumed after an HA restart.
 scylla_update_in_progress:
   name: "Scylla update in progress"
-  initial: false
   icon: mdi:cloud-download
 
 # Mirrors enable_battery_protection from the scheduler (written on every run).

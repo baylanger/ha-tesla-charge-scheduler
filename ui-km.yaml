@@ -4,17 +4,20 @@
 type: vertical-stack
 cards:
   # ── Charger status badge ─────────────────────────────────────────────────
+  # A protection charge is either a protection-only target (50% → 42%,
+  # 51% → 47%, no target range above it) or a protection run (flag on).
   - type: markdown
     content: >
       {% set charging_state = states('sensor.scylla_charging_state') | lower %}
       {% set is_connected = is_state('binary_sensor.scylla_charger', 'on') %}
-      {% set is_charging = charging_state == 'charging' %}
-      {% set current_pct = states('sensor.scylla_usable_battery_level') | float(0) %}
-      {% set protection_low = states('input_number.scylla_protection_low') | float(42) %}
+      {% set is_charging = charging_state in ['charging', 'starting'] %}
+      {% set protection_only = state_attr('sensor.scylla_charge_target_pct', 'protection_only') | default(false, true) %}
       {% set protection_on = is_state('input_boolean.scylla_battery_protection_enabled', 'on') %}
+      {% set protection_run = is_state('input_boolean.scylla_protection_charge_active', 'on') %}
+      {% set at_location = is_state('binary_sensor.scylla_at_charging_location', 'on') %}
       {% if not is_connected or charging_state == 'disconnected' %}
       <ha-alert alert-type="error">🔴 Not connected to charger</ha-alert>
-      {% elif is_charging and protection_on and current_pct < protection_low %}
+      {% elif is_charging and at_location and protection_on and (protection_run or protection_only) %}
       <ha-alert alert-type="warning">🔋 Charging for battery protection</ha-alert>
       {% elif is_charging %}
       <ha-alert alert-type="success">🟢 Charging</ha-alert>
@@ -28,6 +31,7 @@ cards:
   - type: entities
     title: Tesla Charge Schedule
     entities:
+      # "Charging", a planned time, or "Not needed" (read from the scheduler's plan)
       - entity: sensor.scylla_charge_start_at
         name: Start at
         icon: mdi:clock-start
@@ -55,6 +59,9 @@ cards:
         mode: box
       - entity: input_select.scylla_charging_speed
         name: Charging speed
+      # ON = the scheduler manages charging here (see input_text.scylla_charging_locations)
+      - entity: binary_sensor.scylla_at_charging_location
+        name: At a charging location
 
 
   # ── Voltage and phase info ────────────────────────────────────────────────
@@ -73,7 +80,7 @@ cards:
       &nbsp;&nbsp;|&nbsp;&nbsp; 🔌 Live: **{{ live_voltage | int }}V** · {{ phases }} phase{% if phases > 1 %}s{% endif %}
       {% endif %}
 
-  # ── Range → % conversion display ─────────────────────────────────────────
+  # ── Target range → % (the range is a minimum: it only raises the target) ─
   - type: conditional
     conditions:
       - condition: numeric_state
@@ -82,14 +89,17 @@ cards:
     card:
       type: markdown
       content: >
-        {% set current_pct = states('sensor.scylla_usable_battery_level') | float(0) %}
-        {% set current_range = states('sensor.scylla_est_battery_range') | float(0) %}
         {% set target_range = states('input_number.scylla_target_range_km') | float(0) %}
-        {% if current_pct > 0 and current_range > 0 %}
-          {% set full_range = current_range / (current_pct / 100) %}
-          {% set range_pct = [(target_range / full_range * 100) | round(0) | int, 100] | min %}
-          📍 {{ target_range | int }} km → **{{ range_pct }}%**
-          {% if range_pct >= 100 %}⚠️ Range not achievable at current efficiency — will charge to 100%{% endif %}
+        {% set needed = state_attr('sensor.scylla_charge_target_pct', 'range_needed_pct') | int(0) %}
+        {% set limit_target = state_attr('sensor.scylla_charge_target_pct', 'limit_target') | int(0) %}
+        {% if needed <= 0 %}
+          📍 {{ target_range | int }} km → waiting for the car's range reading
+        {% elif needed > 100 %}
+          📍 {{ target_range | int }} km → **{{ needed }}%** ⚠️ Not reachable on one charge — will charge to 100%
+        {% elif needed > limit_target %}
+          📍 {{ target_range | int }} km → **{{ needed }}%** (raises the target from {{ limit_target }}%)
+        {% else %}
+          📍 {{ target_range | int }} km → {{ needed }}% — your {{ limit_target }}% target already covers it
         {% endif %}
 
   # ── Charge history ───────────────────────────────────────────────────────

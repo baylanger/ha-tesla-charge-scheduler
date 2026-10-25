@@ -1,0 +1,14 @@
+# Your charging locations, comma-separated: "home" and/or the names of zones
+# on the HA map (Settings → Areas, labels & zones → Zones), e.g.
+#   home, Chalet, Work
+# Not case-sensitive. The scheduler plans and protects charges, and the
+# helper stops charges at the protection cap, only at these places; anywhere
+# else (Superchargers, public chargers) the car charges normally. Leaving any
+# of them resets the target, departure and speed to the defaults.
+# Each location's default amps is set in the helper's location_amps variable.
+# Empty = home only. No `initial:` so your edit survives restarts; on a new
+# install type "home" (or leave it empty).
+scylla_charging_locations:
+  name: "Scylla charging locations"
+  max: 255
+  icon: mdi:map-marker-multiple

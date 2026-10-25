@@ -1,131 +1,297 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# Scylla - Smart Charge Helper
+#
+# Everything that keeps Home Assistant and the car in sync, and the battery-
+# protection stop. Runs next to the scheduler (separate automation).
+#
+#   • remembers the last battery % (for when the car sleeps)
+#   • sets each charging location's default amps when the car arrives there
+#   • speed selector → amps
+#   • car charge limit changed (Tesla app, screen) → copied into HA
+#   • HA target changed while away → sent to the car right away
+#   • target range: warns when it can't be reached on one charge
+#   • amps: HA ↔ car, with a sanity check
+#   • stops a charge at the protection cap (at charging locations only)
+#   • one notification when a charge has really started
+#   • pauses charging during a software update, resumes after
+#
+# NOTE: the Home Assistant automation editor removes YAML comments when you
+# save. Steps have an `alias:` which survives and shows in traces.
+# ═════════════════════════════════════════════════════════════════════════════
 alias: Scylla - Smart Charge Helper
 description: >
-  Handles UI changes: speed selection, range input, and charge limit sync. Must
-  run as a separate automation from the main scheduler.
+  Keeps HA and the car in sync (charge limit, amps, speed, target range),
+  stops charging at the battery-protection cap at your charging locations,
+  sets per-location default amps on arrival, notifies when a charge starts,
+  pauses charging during software updates. Works with the Smart Charge Scheduler.
 
-  default_amps_fallback (see variables) is only used when an amps helper or
-  sensor is unknown or unavailable, e.g. right after an HA restart. Keep it
-  equal to default_charging_amps in the scheduler.
+# queued: runs are short (no delays), each trigger handled in order.
+mode: queued
+max: 20
+trace:
+  stored_traces: 40
 
-  notification_target (see variables) is the notify service used for all
-  notifications; keep it equal to notification_target in the scheduler.
+# ── Configuration ────────────────────────────────────────────────────────────
+variables:
+  # Default charging amps per charging location, set when the car arrives.
+  # Keys are the location names in lower case, exactly as in
+  # input_text.scylla_charging_locations ("home" or a zone name).
+  # Example with a second location:   location_amps: {home: 27, chalet: 16}
+  location_amps:
+    home: 27
+  # Used for a location missing from location_amps, and as the template
+  # fallback when an amps value is unknown (car asleep, HA just restarted).
+  default_amps_fallback: 27
+  # Notify service for every notification (keep equal in the scheduler and
+  # in script.yaml). notify.notify = every phone with the Companion app;
+  # notify.mobile_app_<device> = one phone.
+  notification_target: notify.notify
+
 triggers:
-  - entity_id: input_select.scylla_charging_speed
+  # ── Battery % memory ───────────────────────────────────────────────────────
+  - trigger: state
+    entity_id: sensor.scylla_usable_battery_level
+    not_to:
+      - unknown
+      - unavailable
+    id: save_battery_level
+
+  # ── Arrived at a charging location → that location's default amps ──────────
+  - trigger: state
+    entity_id: binary_sensor.scylla_at_charging_location
+    from: 'off'
+    to: 'on'
+    id: arrived
+
+  # ── UI inputs ──────────────────────────────────────────────────────────────
+  - trigger: state
+    entity_id: input_select.scylla_charging_speed
     id: speed_changed
-    trigger: state
-  - entity_id: sensor.scylla_charge_limit
-    id: charge_limit_changed
-    trigger: state
-  - entity_id: input_number.scylla_target_range_km
+  - trigger: state
+    entity_id:
+      - input_number.scylla_target_range_km
+      - input_number.scylla_target_range_mi
+    # 2 s: let sensor.scylla_charge_target_pct recalculate first
+    for:
+      seconds: 2
     id: range_changed
-    trigger: state
-  - entity_id: input_number.scylla_target_range_mi
-    id: range_changed
-    trigger: state
-  - entity_id: number.scylla_charging_amps
+  # Target % edited in HA (only acted on away from charging locations; at a
+  # charging location the scheduler sends it when the charge starts)
+  - trigger: state
+    entity_id: input_number.scylla_set_charge_limit
+    for:
+      seconds: 3
+    id: limit_edited
+  - trigger: state
+    entity_id: input_number.scylla_set_charging_amps
+    id: ui_amps_edited
+
+  # ── Car-side changes ───────────────────────────────────────────────────────
+  # The RAW TeslaMate value. (An earlier version read a template sensor that
+  # fell back to the HA slider while the car was asleep, so it "changed" after
+  # every restart and overwrote your target; that sensor is removed.)
+  - trigger: state
+    entity_id: sensor.scylla_charge_limit_soc
+    id: car_limit_changed
+  # 20 s: let a burst of amps updates settle before reacting
+  - trigger: state
+    entity_id: number.scylla_charging_amps
     for:
       seconds: 20
     id: amps_changed
-    trigger: state
-  - entity_id: input_number.scylla_set_charging_amps
-    id: ui_amps_edited
-    trigger: state
-  - entity_id: sensor.scylla_state
+  - trigger: state
+    entity_id: sensor.scylla_state
     to: online
     id: car_awake
-    trigger: state
-  - entity_id: sensor.scylla_usable_battery_level
-    id: battery_level_changed
-    trigger: state
-  - entity_id: binary_sensor.scylla_charging
-    to: 'on'
-    id: battery_level_changed
-    trigger: state
-  - entity_id: sensor.scylla_charging_state
-    id: battery_level_changed
-    trigger: state
-  - event: start
-    id: battery_level_changed
-    trigger: homeassistant
-  - entity_id: update.scylla_software_update
+
+  # ── Protection stop checks ─────────────────────────────────────────────────
+  - trigger: state
+    entity_id: sensor.scylla_usable_battery_level
+    id: protection_check
+  - trigger: state
+    entity_id: sensor.scylla_charging_state
+    id: protection_check
+  - trigger: homeassistant
+    event: start
+    id: protection_check
+
+  # ── Charging started ───────────────────────────────────────────────────────
+  # Right away: make sure the car uses HA's limit and amps
+  - trigger: state
+    entity_id: sensor.scylla_charging_state
+    to: Charging
+    id: charging_started
+  # After 1 minute: one notification (a charge the scheduler stops right
+  # away, e.g. the car starting by itself at plug-in, never notifies)
+  - trigger: state
+    entity_id: sensor.scylla_charging_state
+    to: Charging
+    for:
+      minutes: 1
+    id: charging_notify
+
+  # ── Software update ────────────────────────────────────────────────────────
+  # attribute + from/to: only real false→true / true→false changes, not every
+  # attribute refresh (that caused false "update complete" messages).
+  - trigger: state
+    entity_id: update.scylla_software_update
     attribute: in_progress
     from: false
     to: true
     id: update_started
-    trigger: state
-  - entity_id: update.scylla_software_update
+  # 3 minutes after the update finished (the car needs time to come back)
+  - trigger: state
+    entity_id: update.scylla_software_update
     attribute: in_progress
     from: true
     to: false
+    for:
+      minutes: 3
     id: update_finished
-    trigger: state
-  - entity_id: device_tracker.scylla_location
-    to: home
-    id: arrived_home
-    trigger: state
-  - entity_id: sensor.scylla_usable_battery_level
-    id: save_battery_level
-    trigger: state
+
 conditions: []
+
 actions:
+  # Facts used by several branches
+  - variables:
+      at_location: "{{ is_state('binary_sensor.scylla_at_charging_location', 'on') }}"
+      location: "{{ states('device_tracker.scylla_location') | lower | trim }}"
+      plugged: "{{ is_state('binary_sensor.scylla_charger', 'on') }}"
+      # Only charging_state is trusted (binary_sensor.scylla_charging can stay
+      # "on" for hours after a charge stopped).
+      charging: "{{ states('sensor.scylla_charging_state') | lower in ['charging', 'starting'] }}"
+      car_online: "{{ states('sensor.scylla_state') in ['online', 'charging'] }}"
+      set_limit: "{{ states('input_number.scylla_set_charge_limit') | int(50) }}"
+      # What the scheduler is aiming for: 42 / 47 under protection, else the
+      # higher of the target % and what the target range needs
+      target_pct: "{{ states('sensor.scylla_charge_target_pct') | float(set_limit) }}"
+      protection_only: "{{ state_attr('sensor.scylla_charge_target_pct', 'protection_only') | default(false, true) }}"
+      # The limit the car should have: the target, but never below 50 (the
+      # car refuses lower limits)
+      car_limit_wanted: "{{ [target_pct | int, 50] | max }}"
+      flag_on: "{{ is_state('input_boolean.scylla_protection_charge_active', 'on') }}"
+      # Where a protection run (flag ON) stops: the 42% / 47% protection-only
+      # target, or 42% when a higher target waits for its planned start
+      protection_cap: >
+        {{ target_pct if protection_only
+           else states('input_number.scylla_protection_low') | float(42) }}
+      ha_amps: "{{ states('input_number.scylla_set_charging_amps') | int(default_amps_fallback) }}"
+      car_amps_known: "{{ states('number.scylla_charging_amps') | is_number }}"
+      car_amps: "{{ states('number.scylla_charging_amps') | int(0) }}"
+
   - choose:
-      - conditions:
+      # ═════════════════════════════════════════════════════════════════════
+      # Remember the last real battery % (sensor.scylla_usable_battery_level_safe
+      # shows it while the car sleeps)
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Save the last known battery %
+        conditions:
           - condition: trigger
             id: save_battery_level
           - condition: template
-            value_template: >
-              {{ trigger.to_state.state not in ['unknown', 'unavailable',
-              'none']
-                 and trigger.to_state.state | float(0) > 0 }}
+            value_template: "{{ trigger.to_state.state | float(0) > 0 }}"
         sequence:
           - action: input_number.set_value
             target:
               entity_id: input_number.scylla_last_known_battery
             data:
-              value: '{{ trigger.to_state.state | float(0) }}'
-      - conditions:
+              value: "{{ trigger.to_state.state | float(0) }}"
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Arrived at a charging location → its default amps
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Arrived → this location's default amps
+        conditions:
           - condition: trigger
-            id: arrived_home
+            id: arrived
         sequence:
-          - action: input_number.set_value
+          - variables:
+              new_amps: "{{ location_amps.get(location, default_amps_fallback) | int }}"
+          # The default is what "Fast" restores (speed selector)
+          - alias: Remember this location's default amps
+            action: input_number.set_value
+            target:
+              entity_id: input_number.scylla_default_charging_amps
+            data:
+              value: "{{ new_amps }}"
+          - alias: Planned amps = this location's default
+            action: input_number.set_value
             target:
               entity_id: input_number.scylla_set_charging_amps
             data:
-              value: >-
-                {{ states('input_number.scylla_default_charging_amps') |
-                int(default_amps_fallback) }}
+              value: "{{ new_amps }}"
+          # Send to the car only if it's awake (never wake it for this; the
+          # start-charge script sends the amps anyway)
+          - alias: Send to the car if it's awake
+            if:
+              - condition: template
+                value_template: "{{ car_online and car_amps_known and car_amps != new_amps }}"
+            then:
+              - action: number.set_value
+                target:
+                  entity_id: number.scylla_charging_amps
+                data:
+                  value: "{{ new_amps }}"
+                continue_on_error: true
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Speed selector → amps
+      #   Fast            → this location's default amps
+      #   Slow 12A / 16A  → 12 or 16 A (12 A on a 100 V network), never more
+      #                     than the current amps
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Speed changed → amps
+        conditions:
+          - condition: trigger
+            id: speed_changed
+        sequence:
+          - variables:
+              speed: "{{ trigger.to_state.state }}"
+              slow_cap: >
+                {% set slow_v = states('input_number.scylla_slow_voltage') | float(120) %}
+                {{ 12 if (slow_v <= 100 or speed == 'Slow 12A (15A breaker)') else 16 }}
+              new_amps: >
+                {% if speed == 'Fast' %}
+                  {{ states('input_number.scylla_default_charging_amps') | int(default_amps_fallback) }}
+                {% else %}
+                  {{ [ha_amps, slow_cap | int] | min }}
+                {% endif %}
           - if:
               - condition: template
-                value_template: >
-                  {{ states('number.scylla_charging_amps') not in ['unknown',
-                  'unavailable']
-                    {{ 12 if slow_v <= 100 else (12 if speed == 'Slow 12A (15A
-                    breaker)' else 16) }}
-                  new_amps: >
-                    {% set current =
-                    states('input_number.scylla_set_charging_amps') |
-                    float(default_amps_fallback) %} {{ [current, slow_cap | int]
-                    | min | int }}
+                value_template: "{{ new_amps | int != ha_amps }}"
+            then:
               - action: input_number.set_value
                 target:
                   entity_id: input_number.scylla_set_charging_amps
                 data:
-                  value: '{{ new_amps }}'
-      - conditions:
+                  value: "{{ new_amps }}"
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Charge limit changed ON THE CAR (Tesla app or screen) → becomes the
+      # HA target. Ignored when:
+      #   • the old or new value isn't a number (car waking up / HA restart)
+      #   • it's the value HA itself sent (target, or 50 for protection,
+      #     including the 50% set for a protection run before a full charge)
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Car limit changed → copy into HA
+        conditions:
           - condition: trigger
-            id: charge_limit_changed
+            id: car_limit_changed
           - condition: template
-            value_template: |
-              {{ states('sensor.scylla_charge_limit') | float(0) !=
-                 states('input_number.scylla_set_charge_limit') | float(0) }}
+            value_template: >
+              {{ trigger.from_state is not none
+                 and trigger.from_state.state | is_number
+                 and trigger.to_state.state | is_number
+                 and trigger.to_state.state | int != set_limit
+                 and trigger.to_state.state | int != car_limit_wanted
+                 and not (flag_on and trigger.to_state.state | int == 50) }}
         sequence:
           - action: input_number.set_value
             target:
               entity_id: input_number.scylla_set_charge_limit
             data:
-              value: >
-                {{ [states('sensor.scylla_charge_limit') | float(50), 50] | max
-                | int }}
+              value: "{{ [trigger.to_state.state | int, 50] | max }}"
+          # A limit set on the car replaces any target range
           - action: input_number.set_value
             target:
               entity_id: input_number.scylla_target_range_km
@@ -136,80 +302,317 @@ actions:
               entity_id: input_number.scylla_target_range_mi
             data:
               value: 0
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Target % edited in HA while AWAY from charging locations → send it to
+      # the car now, and start charging if plugged in and it's needed.
+      # (At a charging location the scheduler decides when to charge.)
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Away → send the new target to the car
+        conditions:
+          - condition: trigger
+            id: limit_edited
+          - condition: template
+            value_template: >
+              {{ not at_location
+                 and states('sensor.scylla_charge_limit_soc') | int(0) != [set_limit, 50] | max }}
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: number.scylla_charge_limit
+            data:
+              value: "{{ [set_limit, 50] | max }}"
+            continue_on_error: true
           - if:
-              - condition: state
-                entity_id: input_boolean.scylla_protection_charge_active
-                state: 'on'
               - condition: template
-                value_template: |
-                  {{ states('sensor.scylla_charge_limit') | float(0) > 51 }}
+                value_template: >
+                  {{ plugged and not charging
+                     and set_limit > states('sensor.scylla_usable_battery_level_safe') | float(100) }}
             then:
-              - variables:
-                  current_pct: >
-                    {{ states('sensor.scylla_usable_battery_level') | float(0)
-                    }}
-                  protection_low: >
-                    {{ states('input_number.scylla_protection_low') | float(42)
-                    }}
-                  amps: >
-                    {{ states('sensor.scylla_charging_amps') |
-                    float(default_amps_fallback) }}
-                  capacity: >
-                    {{ states('input_number.scylla_battery_capacity_kwh') |
-                    float(75) }}
-                  slow_v: >
-                    {{ states('input_number.scylla_slow_voltage') | float(120)
-                    }}
-                  fast_v: >
-                    {{ states('input_number.scylla_fast_voltage') | float(240)
-                    }}
-                  live_voltage: |
-                    {{ states('sensor.scylla_charger_voltage') | float(0) }}
-                  voltage: |
-                    {{ live_voltage if live_voltage > 75 else fast_v }}
-                  min_per_pct: |
-                    {{ (pct_needed_total * min_per_pct) | int }}
-                  departure_str: |
-                    {{ states('input_datetime.scylla_departure_time') }}
-                  dep_seconds: >
-                    {% set t = departure_str.split(':') %} {{ t[0]|int * 3600 +
-                    t[1]|int * 60 }}
-                  now_seconds: |
-                    {{ now().hour * 3600 + now().minute * 60 + now().second }}
-                  start_seconds: >
-                    {% set s = dep_seconds - total_minutes * 60 %} {{ s if s >=
-                    0 else s + 86400 }}
-                  protection_finish_seconds: |
-                    {{ now_seconds + minutes_to_finish_protection * 60 }}
-              - choose:
-                  - conditions:
-                      - condition: template
-                        value_template: |
-                          {{ protection_finish_seconds > start_seconds }}
-                    sequence:
-                      - action: input_boolean.turn_off
-                        target:
-                          entity_id: input_boolean.scylla_protection_charge_active
-                      - action: '{{ notification_target }}'
-                        data:
-                          message: >
-                            Scylla battery protection cancelled — charging
-                            straight to {{ states('sensor.scylla_charge_limit')
-                            | int }}% now.
-                default:
-                  - action: '{{ notification_target }}'
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.scylla_charger
+                continue_on_error: true
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Target range (km or mi) set → only checks it. The range is a minimum
+      # added to the target % (sensor.scylla_charge_target_pct takes the
+      # higher of the two); it never changes the target % slider, so a short
+      # range can't lower your target.
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Target range set → warn if it can't be converted or reached
+        conditions:
+          - condition: trigger
+            id: range_changed
+          - condition: template
+            value_template: "{{ trigger.to_state.state | float(0) > 0 }}"
+        sequence:
+          - variables:
+              is_km: "{{ trigger.entity_id == 'input_number.scylla_target_range_km' }}"
+              target_range: "{{ trigger.to_state.state | float(0) }}"
+              # Uncapped, so a range above a full battery can be reported
+              needed_pct: "{{ state_attr('sensor.scylla_charge_target_pct', 'range_needed_pct') | int(0) }}"
+          - choose:
+              - alias: No range reading → can't convert
+                conditions:
+                  - condition: template
+                    value_template: "{{ needed_pct <= 0 }}"
+                sequence:
+                  - action: "{{ notification_target }}"
                     data:
                       message: >
-                        Scylla target updated to {{
-                        states('sensor.scylla_charge_limit') | int }}%. Battery
-                        protection continues to {{ protection_low | int }}%,
-                        then scheduled charge will follow.
-      - conditions:
+                        Scylla range sensors unavailable — can't convert
+                        {{ target_range | int }} {{ 'km' if is_km else 'mi' }} to a %
+                        yet. The target % is used until the car reports its range.
+              - alias: More than a full battery → warn (charges to 100%)
+                conditions:
+                  - condition: template
+                    value_template: "{{ needed_pct > 100 }}"
+                sequence:
+                  - action: "{{ notification_target }}"
+                    data:
+                      message: >
+                        ⚠️ {{ target_range | int }} {{ 'km' if is_km else 'mi' }} isn't
+                        reachable on one charge (~{{ needed_pct }}% needed). Scylla will
+                        charge to 100%.
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Battery protection stop — at charging locations only (a public
+      # charger away from them is never stopped). Silent.
+      #   • a target below 50% reached (42 / 47% protection, or a target
+      #     range needing less than 50%: the car can't stop there itself), or
+      #   • a protection run (flag ON) reached its cap
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Protection cap reached → stop charging
+        conditions:
+          - condition: trigger
+            id: protection_check
+          - condition: state
+            entity_id: input_boolean.scylla_battery_protection_enabled
+            state: 'on'
+          - condition: template
+            value_template: >
+              {% set pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
+              {{ at_location and charging and pct > 0
+                 and ((target_pct < 50 and pct >= target_pct)
+                      or (flag_on and pct >= protection_cap)) }}
+        sequence:
+          - action: switch.turn_off
+            target:
+              entity_id: switch.scylla_charger
+            continue_on_error: true
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.scylla_protection_charge_active
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Charging started at a charging location (by us, by the car itself at
+      # plug-in, or from the app) → make sure the car uses HA's amps.
+      # (The limit is handled by the scheduler: it sends the target when a
+      # charge it keeps going is not limited correctly, and it stops a charge
+      # that started too early — sending 80% to a car that is about to be
+      # stopped would be risky.)
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Charging started → HA amps on the car
+        conditions:
+          - condition: trigger
+            id: charging_started
+          - condition: template
+            value_template: "{{ at_location and car_amps_known and car_amps != ha_amps and ha_amps >= 5 }}"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: number.scylla_charging_amps
+            data:
+              value: "{{ ha_amps }}"
+            continue_on_error: true
+
+      # ═════════════════════════════════════════════════════════════════════
+      # One notification once a charge has run for a minute (charging
+      # locations only).
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Charging for 1 minute → notify
+        conditions:
+          - condition: trigger
+            id: charging_notify
+          - condition: template
+            value_template: "{{ at_location }}"
+        sequence:
+          - variables:
+              pct: "{{ states('sensor.scylla_usable_battery_level_safe') | int(0) }}"
+              protection: >
+                {{ flag_on or protection_only }}
+              cap: "{{ protection_cap | int }}"
+              volts: "{{ states('sensor.scylla_charger_voltage') | int(0) }}"
+              amps_now: "{{ states('sensor.scylla_charger_actual_current') | int(0) }}"
+              phases: "{{ states('sensor.scylla_charger_phases') | int(1) }}"
+              # TeslaMate's time_to_full_charge is in hours
+              car_minutes: "{{ (states('sensor.scylla_time_to_full_charge') | float(0) * 60) | round(0) | int }}"
+          - action: "{{ notification_target }}"
+            data:
+              message: >
+                {% if protection %}
+                🔋 Scylla battery protection: charging {{ pct }}% → {{ cap }}%.
+                {% else %}
+                ⚡ Scylla charging {{ pct }}% → {{ target_pct | int }}%
+                {%- if volts > 0 and amps_now > 0 %}
+                — {{ volts }} V · {{ amps_now }} A · {{ phases }} phase{{ 's' if phases > 1 }}
+                {%- endif %}
+                {%- if car_minutes > 0 %}
+                · car estimate {{ car_minutes // 60 }}h{{ '%02d' | format(car_minutes % 60) }}
+                (done ~{{ (now() + timedelta(minutes=car_minutes)).strftime('%H:%M') }})
+                {%- endif %}.
+                {% endif %}
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Amps changed on the car
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Car amps changed
+        conditions:
+          - condition: trigger
+            id: amps_changed
+          - condition: template
+            value_template: "{{ trigger.to_state.state | is_number }}"
+        sequence:
+          - variables:
+              live_amps: "{{ trigger.to_state.state | int }}"
+              sanity_max: "{{ states('input_number.scylla_amps_sanity_max') | int(40) }}"
+              car_max_amps: "{{ state_attr('number.scylla_charging_amps', 'max') | int(48) }}"
+              # Plugged in during the last 3 minutes: the car has just restored
+              # the amps it remembers for this place (often 32 A at home)
+              just_plugged: >
+                {{ plugged and (as_timestamp(now())
+                    - as_timestamp(states.binary_sensor.scylla_charger.last_changed)) < 180 }}
+              # Car just woke up (was unknown/unavailable)
+              woke_up: >
+                {{ trigger.from_state is not none
+                   and not (trigger.from_state.state | is_number) }}
+          - choose:
+              # Away: the car is the boss, just mirror its value in HA
+              - alias: Away → mirror only
+                conditions:
+                  - condition: template
+                    value_template: "{{ not at_location }}"
+                sequence:
+                  - if:
+                      - condition: template
+                        value_template: "{{ live_amps != ha_amps and live_amps >= 5 }}"
+                    then:
+                      - action: input_number.set_value
+                        target:
+                          entity_id: input_number.scylla_set_charging_amps
+                        data:
+                          value: "{{ [live_amps, 48] | min }}"
+
+              # At a charging location, the car changed amps on its own
+              # (wake-up or plug-in restore) → put HA's amps back
+              - alias: Car restored its own amps → push HA's amps
+                conditions:
+                  - condition: template
+                    value_template: "{{ (woke_up or just_plugged) and live_amps != ha_amps }}"
+                sequence:
+                  - action: number.set_value
+                    target:
+                      entity_id: number.scylla_charging_amps
+                    data:
+                      value: "{{ ha_amps }}"
+                    continue_on_error: true
+
+              # A reading above the sanity ceiling is treated as a glitch
+              - alias: Implausible reading → ignore and warn
+                conditions:
+                  - condition: template
+                    value_template: "{{ live_amps > sanity_max }}"
+                sequence:
+                  - action: "{{ notification_target }}"
+                    data:
+                      message: >
+                        Scylla reported {{ live_amps }} A, above the {{ sanity_max }} A
+                        sanity ceiling — ignored as a likely glitch. Check
+                        number.scylla_charging_amps in History if this keeps happening.
+
+            # Otherwise you changed the amps in the Tesla app → HA follows,
+            # capped to the car's own maximum.
+            default:
+              - variables:
+                  effective_amps: "{{ [live_amps, car_max_amps] | min }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ effective_amps < live_amps }}"
+                then:
+                  - action: number.set_value
+                    target:
+                      entity_id: number.scylla_charging_amps
+                    data:
+                      value: "{{ effective_amps }}"
+                    continue_on_error: true
+              - if:
+                  - condition: template
+                    value_template: "{{ effective_amps != ha_amps and effective_amps >= 5 }}"
+                then:
+                  - action: input_number.set_value
+                    target:
+                      entity_id: input_number.scylla_set_charging_amps
+                    data:
+                      value: "{{ effective_amps }}"
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Amps edited in HA → send to the car if it's awake (never wakes it)
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: HA amps edited → send to the car
+        conditions:
+          - condition: trigger
+            id: ui_amps_edited
+          - condition: template
+            value_template: "{{ car_online and car_amps_known and car_amps != ha_amps }}"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: number.scylla_charging_amps
+            data:
+              value: "{{ ha_amps }}"
+            continue_on_error: true
+      - alias: HA amps edited by you, car asleep → tell you
+        conditions:
+          - condition: trigger
+            id: ui_amps_edited
+          - condition: template
+            # user_id is set only when a person changed it (not an automation)
+            value_template: "{{ trigger.to_state.context.user_id is not none and not car_online }}"
+        sequence:
+          - action: "{{ notification_target }}"
+            data:
+              message: >
+                Scylla is asleep — {{ ha_amps }} A wasn't sent so the car isn't
+                woken up. It's sent when the car wakes at a charging location or
+                when a charge starts.
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Car woke up at a charging location → send HA's amps if different
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Car awake at a charging location → send HA's amps
+        conditions:
+          - condition: trigger
+            id: car_awake
+          - condition: template
+            value_template: "{{ at_location and car_amps_known and car_amps != ha_amps }}"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: number.scylla_charging_amps
+            data:
+              value: "{{ ha_amps }}"
+            continue_on_error: true
+
+      # ═════════════════════════════════════════════════════════════════════
+      # Software update while charging → pause; resume 3 min after it ends
+      # ═════════════════════════════════════════════════════════════════════
+      - alias: Update started while charging → pause
+        conditions:
           - condition: trigger
             id: update_started
-          - condition: state
-            entity_id: binary_sensor.scylla_charging
-            state: 'on'
+          - condition: template
+            value_template: "{{ charging }}"
         sequence:
           - action: input_boolean.turn_on
             target:
@@ -217,18 +620,16 @@ actions:
           - action: switch.turn_off
             target:
               entity_id: switch.scylla_charger
-          - action: '{{ notification_target }}'
+            continue_on_error: true
+          - action: "{{ notification_target }}"
             data:
               message: >
-                Scylla software update installing ({{
-                state_attr('update.scylla_software_update', 'update_percentage')
-                }}%) — charging paused. Will resume when update finishes.
-      - conditions:
+                Scylla software update installing — charging paused. It resumes
+                when the update finishes.
+      - alias: Update finished → resume the paused charge
+        conditions:
           - condition: trigger
             id: update_finished
-          - condition: state
-            entity_id: binary_sensor.scylla_charger
-            state: 'on'
           - condition: state
             entity_id: input_boolean.scylla_update_in_progress
             state: 'on'
@@ -236,211 +637,14 @@ actions:
           - action: input_boolean.turn_off
             target:
               entity_id: input_boolean.scylla_update_in_progress
-          - delay: '00:03:00'
-          - action: switch.turn_on
-            target:
-              entity_id: switch.scylla_charger
-          - action: '{{ notification_target }}'
-            data:
-              message: |
-                Scylla software update complete — charging resumed.
-      - conditions:
-          - condition: trigger
-            id: battery_level_changed
-          - condition: state
-            entity_id: input_boolean.scylla_battery_protection_enabled
-            state: 'on'
-          - condition: template
-            value_template: |
-              {{ states('sensor.scylla_charging_state') | lower == 'charging'
-                 or is_state('binary_sensor.scylla_charging', 'on') }}
-          - condition: template
-            value_template: >
-              {% set current_pct = states('sensor.scylla_usable_battery_level')
-              | float(0) %} {% set set_limit =
-            target:
-              entity_id: input_boolean.scylla_protection_charge_active
-          - action: switch.turn_off
-            target:
-              entity_id: switch.scylla_charger
-          - action: '{{ notification_target }}'
-            data:
-              message: >
-                Scylla charging paused at {{
-                states('sensor.scylla_usable_battery_level') | int }}% (battery
-                protection cap reached). Will resume at scheduled time.
-      - conditions:
-          - condition: trigger
-            id: amps_changed
-          - condition: template
-            value_template: |
-              {{ trigger.to_state.state not in ['unknown', 'unavailable'] }}
-        sequence:
-          - variables:
-              live_amps: >
-                {{ states('number.scylla_charging_amps') |
-                int(default_amps_fallback) }}
-              at_home: |
-                {{ is_state('device_tracker.scylla_location', 'home') }}
           - if:
               - condition: template
-                value_template: '{{ not at_home }}'
+                value_template: "{{ plugged }}"
             then:
-              - if:
-                  - condition: template
-                    value_template: >
-                      {{ live_amps !=
-                      (states('input_number.scylla_set_charging_amps') |
-                      int(default_amps_fallback)) }}
-                then:
-                  - action: input_number.set_value
-                    target:
-                      entity_id: input_number.scylla_set_charging_amps
-                    data:
-                      value: '{{ live_amps }}'
-              - stop: Away from home — mirrored only, no car writes
-          - if:
-              - condition: template
-                value_template: |
-                  {{ trigger.from_state is not none
-                     and trigger.from_state.state in ['unknown', 'unavailable']
-                     and live_amps != (states('input_number.scylla_set_charging_amps') | int(default_amps_fallback)) }}
-            then:
-              - action: number.set_value
+              - action: switch.turn_on
                 target:
-                  entity_id: number.scylla_charging_amps
+                  entity_id: switch.scylla_charger
+                continue_on_error: true
+              - action: "{{ notification_target }}"
                 data:
-                  value: >-
-                    {{ states('input_number.scylla_set_charging_amps') |
-                    int(default_amps_fallback) }}
-              - stop: Wake-up at home — pushed UI amps to car
-          - variables:
-              sanity_max: |
-                {{ states('input_number.scylla_amps_sanity_max') | int(40) }}
-          - if:
-              - condition: template
-                value_template: '{{ live_amps > sanity_max }}'
-            then:
-              - action: '{{ notification_target }}'
-                data:
-                  message: >
-                    Scylla reported {{ live_amps }}A, above the {{ sanity_max
-                    }}A sanity ceiling — ignoring this reading as a likely
-                    glitch. Check Developer Tools → History for
-                    number.scylla_charging_amps if this keeps happening.
-              - stop: Implausible amps reading rejected
-          - variables:
-              car_max_amps: |
-                {{ state_attr('number.scylla_charging_amps', 'max') | int(48) }}
-              effective_amps: |
-                {{ [live_amps, car_max_amps, sanity_max] | min }}
-          - choose:
-              - conditions:
-                  - condition: template
-                    value_template: '{{ effective_amps < live_amps }}'
-                sequence:
-                  - action: number.set_value
-                    target:
-                      entity_id: number.scylla_charging_amps
-                    data:
-            id: ui_amps_edited
-          - condition: template
-            value_template: '{{ states(''sensor.scylla_state'') in [''online'', ''charging''] }}'
-          - condition: template
-            value_template: >
-              {{ states('number.scylla_charging_amps') not in ['unknown',
-              'unavailable']
-                 and (states('input_number.scylla_set_charging_amps') | int(default_amps_fallback))
-                     != (states('number.scylla_charging_amps') | int(default_amps_fallback)) }}
-        sequence:
-          - action: number.set_value
-            target:
-              entity_id: number.scylla_charging_amps
-            data:
-              value: '{{ states(''input_number.scylla_set_charging_amps'') | int }}'
-      - conditions:
-          - condition: trigger
-            id: ui_amps_edited
-          - condition: template
-            value_template: >-
-              {{ trigger.to_state.context.user_id is not none and
-              states('sensor.scylla_state') not in ['online', 'charging'] }}
-        sequence:
-          - action: '{{ notification_target }}'
-            data:
-              message: >
-                Scylla is not awake - the new amperage ({{
-                states('input_number.scylla_set_charging_amps') | int }}A) was
-                not sent so the car is not woken up. It will be sent when the
-                car comes online at home or just before a charge starts.
-      - conditions:
-          - condition: trigger
-            id: car_awake
-          - condition: state
-            entity_id: device_tracker.scylla_location
-            state: home
-          - condition: template
-            value_template: >
-              {{ states('number.scylla_charging_amps') not in ['unknown',
-              'unavailable']
-                 and (states('input_number.scylla_set_charging_amps') | int(default_amps_fallback))
-                     != (states('number.scylla_charging_amps') | int(default_amps_fallback)) }}
-        sequence:
-          - action: number.set_value
-            target:
-              entity_id: number.scylla_charging_amps
-            data:
-              value: '{{ states(''input_number.scylla_set_charging_amps'') | int }}'
-      - conditions:
-          - condition: trigger
-            id: range_changed
-        sequence:
-          - variables:
-              current_pct: |
-                {{ states('sensor.scylla_usable_battery_level') | float(0) }}
-              current_range: >
-                {{ states('sensor.scylla_est_battery_range' if trigger.entity_id
-                == 'input_number.scylla_target_range_km' else
-                'sensor.scylla_est_battery_range_mi') | float(0) }}
-              target_range: >
-                {% if trigger.entity_id == 'input_number.scylla_target_range_km'
-                %}
-                  {{ states('input_number.scylla_target_range_km') | float(0) }}
-                {% else %}
-                  {{ states('input_number.scylla_target_range_mi') | float(0) }}
-                {% endif %}
-              range_pct: >
-                {% if target_range > 0 and current_pct > 0 and current_range > 0
-                %}
-                  {% set full_range = current_range / (current_pct / 100) %}
-                  {{ [(target_range / full_range * 100) | round(0) | int, 100] | min }}
-                {% else %}
-                  0
-                {% endif %}
-          - choose:
-              - conditions:
-                  - condition: template
-                    value_template: '{{ target_range <= 0 }}'
-                sequence:
-                  - stop: Range cleared — keeping current set_charge_limit
-              - conditions:
-                  - condition: template
-                    value_template: '{{ range_pct <= 0 }}'
-                sequence:
-                  - action: '{{ notification_target }}'
-                    data:
-                      message: >
-                        Scylla range sensors unavailable — cannot calculate
-                        target %. Please try again when the car is awake.
-            default:
-              - action: input_number.set_value
-                target:
-                  entity_id: input_number.scylla_set_charge_limit
-                data:
-                  value: '{{ [range_pct, 100] | min | int }}'
-trace:
-  stored_traces: 40
-mode: queued
-variables:
-  default_amps_fallback: 27
-  notification_target: notify.notify
+                  message: Scylla software update complete — charging resumed.

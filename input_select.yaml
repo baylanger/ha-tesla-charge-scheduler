@@ -1,8 +1,18 @@
+# Charging speed for the next charge at a charging location.
+#   Fast                    → full amps on the 240 V / wall-connector circuit
+#                             (the location's default amps)
+#   Slow 12A (15A breaker)  → 120 V outlet on a 15 A breaker: 12 A max
+#                             (80% continuous-load rule)
+#   Slow 16A (20A breaker)  → 120 V outlet on a 20 A breaker: 16 A max
+# The helper sets the amps when you change it; the scheduler uses the slow or
+# fast voltage to time the charge. Reset to Fast when the car leaves a
+# charging location.
+# Fast is listed first and there's no `initial:`, so a brand-new helper starts
+# at Fast and a selection survives HA restarts.
 scylla_charging_speed:
   name: "Scylla charging speed"
   options:
+    - "Fast"
     - "Slow 12A (15A breaker)"
     - "Slow 16A (20A breaker)"
-    - "Fast"
-  initial: "Fast"
   icon: mdi:speedometer

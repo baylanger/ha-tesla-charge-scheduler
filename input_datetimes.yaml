@@ -1,4 +1,19 @@
+# When you leave next. Time only: the scheduler uses the next occurrence
+# (today if still ahead, else tomorrow). At 18:00 it switches to the next
+# day's default (weekday / weekend, set in the scheduler's variables) unless
+# you set a custom time; leaving a charging location also resets it.
 scylla_departure_time:
   name: "Scylla departure time"
   has_date: false
   has_time: true
+
+# The scheduler's plan: when the next charge will start (date and time).
+# Written by the scheduler only — don't edit it. A time trigger on this
+# helper starts the charge, so the plan survives HA restarts.
+# 2000-01-01 00:00 means "nothing planned". The dashboard's "Charge start at"
+# (sensor.scylla_charge_start_at) reads it.
+scylla_planned_charge_start:
+  name: "Scylla planned charge start"
+  has_date: true
+  has_time: true
+  icon: mdi:clock-start

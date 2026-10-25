@@ -21,12 +21,41 @@
     availability: "{{ has_value('sensor.scylla_speed') }}"
     state: "{{ states('sensor.scylla_speed') | float(0) > 0 }}"
 
+  # ON when the car is at one of your charging locations. The list is the text
+  # helper input_text.scylla_charging_locations, comma-separated, e.g.
+  # "home, Chalet, Work" — "home" or the name of any zone on the HA map
+  # (Settings → Areas, labels & zones → Zones). Not case-sensitive. Empty = "home".
+  # The scheduler and the helper only plan, protect and stop charges while this
+  # is ON; away from these places the car charges normally.
+  # delay_off 3 min: a GPS jump or a TeslaMate reconnect (tracker briefly
+  # "not_home"/unavailable) doesn't count as leaving and doesn't reset anything.
+  - name: Scylla At Charging Location
+    unique_id: scylla_at_charging_location
+    default_entity_id: binary_sensor.scylla_at_charging_location
+    icon: mdi:home-lightning-bolt-outline
+    availability: "{{ has_value('device_tracker.scylla_location') }}"
+    delay_off:
+      minutes: 3
+    state: >
+      {% set raw = states('input_text.scylla_charging_locations') %}
+      {% set raw = raw if has_value('input_text.scylla_charging_locations') and raw | trim != '' else 'home' %}
+      {% set places = raw.split(',') | map('trim') | map('lower') | reject('eq', '') | list %}
+      {{ states('device_tracker.scylla_location') | lower in places }}
+    attributes:
+      location: "{{ states('device_tracker.scylla_location') }}"
+      charging_locations: "{{ states('input_text.scylla_charging_locations') }}"
+
 - sensor:
   - name: Scylla Minute to Full Charge
-    unit_of_measurement: m
+    # "min" = minutes ("m" is metres in Home Assistant)
+    unit_of_measurement: min
+    device_class: duration
     icon: mdi:clock-outline
     unique_id: scylla_minute_to_full_charge
-    state: "{{ (states('sensor.scylla_time_to_full_charge') | float * 60 ) | round(0) }}"
+    # unavailable (instead of a template error in the log) while TeslaMate
+    # has no value
+    availability: "{{ states('sensor.scylla_time_to_full_charge') | is_number }}"
+    state: "{{ (states('sensor.scylla_time_to_full_charge') | float(0) * 60) | round(0) }}"
 
 - sensor:
     # Range in miles. The car's range sensors come from TeslaMate over MQTT and are always
@@ -110,6 +139,8 @@
 
     # Always-available usable battery level — holds last known value when the
     # car sleeps and sensor.scylla_usable_battery_level goes unavailable.
+    # A reading of 0 is treated as "no reading" too (TeslaMate sometimes
+    # publishes 0 while the car wakes up).
     # This is what closed the "missed 4:51 charge" bug: the scheduler's gate
     # condition used the raw sensor directly, and float(0) on 'unavailable'
     # made the gate evaluate to 0, silently skipping the whole schedule
@@ -121,33 +152,16 @@
       state_class: measurement
       state: >
         {% set raw = states('sensor.scylla_usable_battery_level') %}
-        {% if raw not in ['unknown', 'unavailable', 'none', None] %}
+        {% if raw | is_number and raw | float > 0 %}
           {{ raw | float }}
         {% else %}
           {{ states('input_number.scylla_last_known_battery') | float(0) }}
         {% endif %}
 
-    # Always-available charge limit — falls back to sensor when number is unavailable
-    # FIXED: sensor.scylla_charge_limit_soc updates immediately (comes straight
-    # off vehicle_data), while number.scylla_charge_limit can lag behind it by
-    # a poll cycle. Prefer the SOC sensor whenever it's present.
-    - name: "Scylla Charge Limit"
-      unique_id: scylla_charge_limit
-      unit_of_measurement: "%"
-      state_class: measurement
-      state: >
-        {% set soc = states('sensor.scylla_charge_limit_soc') %}
-        {% set num = states('number.scylla_charge_limit') %}
-        {% set helper = states('input_number.scylla_set_charge_limit') %}
-        {% if soc not in ['unknown', 'unavailable', 'none', None] %}
-          {{ soc | float(50) }}
-        {% elif num not in ['unknown', 'unavailable'] %}
-          {{ num | float(50) }}
-        {% else %}
-          {{ helper | float(50) }}
-        {% endif %}
-
-    # Always-available charging amps — falls back to input_number when car asleep
+    # Always-available charging amps: the car's amps while it is really
+    # charging, otherwise the planned amps (input_number.scylla_set_charging_amps).
+    # Uses sensor.scylla_charging_state, not binary_sensor.scylla_charging:
+    # TeslaMate can leave that binary sensor "on" for hours after a charge.
     - name: "Scylla Charging Amps"
       unique_id: scylla_charging_amps
       unit_of_measurement: "A"
@@ -155,13 +169,25 @@
       state: >
         {% set set_amps = states('input_number.scylla_set_charging_amps') | float(27) %}
         {% set num = states('number.scylla_charging_amps') %}
-        {% if is_state('binary_sensor.scylla_charging', 'on') and num not in ['unknown', 'unavailable'] %}
+        {% if states('sensor.scylla_charging_state') | lower in ['charging', 'starting'] and num | is_number %}
           {{ num | float(27) }}
         {% else %}
           {{ set_amps }}
         {% endif %}
 
-    # Minutes to charge 1% based on selected speed and live voltage
+    # Minutes to charge 1%.
+    # Power reaching the battery (W) = volts × amps × phase factor × efficiency
+    #                                  − fixed overhead
+    #   • while charging: the car's live voltage (per phase) × number of phases
+    #   • otherwise: the slow/fast voltage of the selected speed; 380 V and up
+    #     means a 3-phase supply (Europe 400 V), so × √3 (1.732)
+    #   • efficiency: input_number.scylla_charge_efficiency — the losses that
+    #     grow with the power (charger, cable, battery heat), ~94%
+    #   • overhead: input_number.scylla_charge_overhead_w — what the car itself
+    #     uses while charging (~250 W). It is a fixed amount, so it costs a
+    #     slow charge much more than a fast one: 120 V × 12 A ends up ~77%
+    #     efficient, 240 V × 27 A ~90%, with the same two settings.
+    # The scheduler uses the same formula (with the configured voltage).
     - name: "Scylla Charger 1 Percent Increase Time"
       unique_id: scylla_charger_1percent_increase_time
       unit_of_measurement: "min"
@@ -169,23 +195,41 @@
       state: >
         {% set amps = states('sensor.scylla_charging_amps') | float(0) %}
         {% set capacity = states('input_number.scylla_battery_capacity_kwh') | float(75) %}
+        {% set eff = states('input_number.scylla_charge_efficiency') | float(90) / 100 %}
+        {% set overhead = states('input_number.scylla_charge_overhead_w') | float(0) %}
         {% set live_voltage = states('sensor.scylla_charger_voltage') | float(0) %}
-        {% set speed_raw = states('input_select.scylla_charging_speed') %}
-        {% set speed = 'Fast' if speed_raw == 'Fast' else 'Slow' %}
-        {% if live_voltage > 75 %}
+        {% set charging = states('sensor.scylla_charging_state') | lower in ['charging', 'starting'] %}
+        {% if charging and live_voltage > 75 %}
+          {% set factor = states('sensor.scylla_charger_phases') | int(1) %}
           {% set voltage = live_voltage %}
-        {% elif speed == 'Fast' %}
-          {% set voltage = states('input_number.scylla_fast_voltage') | float(240) %}
         {% else %}
-          {% set voltage = states('input_number.scylla_slow_voltage') | float(120) %}
+          {% if states('input_select.scylla_charging_speed') == 'Fast' %}
+            {% set voltage = states('input_number.scylla_fast_voltage') | float(240) %}
+          {% else %}
+            {% set voltage = states('input_number.scylla_slow_voltage') | float(120) %}
+          {% endif %}
+          {% set factor = 1.732 if voltage >= 380 else 1 %}
         {% endif %}
+        {% set watts = [voltage * amps * ([factor, 1] | max) * eff - overhead, 100] | max %}
         {% if amps > 0 and voltage > 0 %}
-          {{ ((capacity * 1000 * 0.01) / (voltage * amps) * 60) | round(2) }}
+          {{ (capacity * 10 / watts * 60) | round(2) }}
         {% else %}
           unknown
         {% endif %}
 
-    # Actual charge target after applying battery protection logic
+    # The % the scheduler is really aiming for.
+    #   1. The target % slider, after battery protection:
+    #        50% → protection low cap (42%), 51% → protection mid cap (47%)
+    #   2. The target range (km or mi), converted to the % it needs from the
+    #      car's current range per % (range ÷ battery %), max 100%.
+    #   Target = the HIGHER of the two. The range is a minimum: it can raise
+    #   the target, never lower it — 55% with a 30 km range stays 55%.
+    # Attributes (read by the scheduler, the helper and the card):
+    #   limit_target     the slider after protection (42 / 47 / the slider)
+    #   range_pct        what the target range needs (0 = no range set)
+    #   range_needed_pct same, not capped at 100 (to warn "not reachable")
+    #   protection_only  true = no departure target, just keep the battery
+    #                    in the protection band
     - name: "Scylla Charge Target Pct"
       unique_id: scylla_charge_target_pct
       unit_of_measurement: "%"
@@ -194,86 +238,105 @@
         {% set limit = states('input_number.scylla_set_charge_limit') | float(50) %}
         {% set low = states('input_number.scylla_protection_low') | float(42) %}
         {% set mid = states('input_number.scylla_protection_mid') | float(47) %}
+        {% set protection = is_state('input_boolean.scylla_battery_protection_enabled', 'on') %}
+        {% set limit_target = (low if limit <= 50 else mid) if (protection and limit <= 51) else limit %}
         {% set target_km = states('input_number.scylla_target_range_km') | float(0) %}
         {% set target_mi = states('input_number.scylla_target_range_mi') | float(0) %}
-        {% set target_range = target_km if target_km > 0 else target_mi %}
-        {% set current_range = (states('sensor.scylla_est_battery_range') if target_km > 0 else states('sensor.scylla_est_battery_range_mi')) | float(0) %}
-        {% set current_pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
-        {% set protection = is_state('input_boolean.scylla_battery_protection_enabled', 'on') %}
-        {% set range_based = limit %}
-        {% if target_range > 0 and current_pct > 0 and current_range > 0 %}
-          {% set full_range = current_range / (current_pct / 100) %}
-          {% set range_based = [(target_range / full_range * 100) | round(0) | int, 100] | min %}
-        {% endif %}
-        {% if protection and range_based <= 50 %}
-          {{ low }}
-        {% elif protection and range_based == 51 %}
-          {{ mid }}
-        {% else %}
-          {{ range_based }}
-        {% endif %}
+        {% set km = target_km > 0 %}
+        {% set target_range = target_km if km else target_mi %}
+        {% set current_range = states('sensor.scylla_est_battery_range' if km
+                                      else 'sensor.scylla_est_battery_range_mi') | float(0) %}
+        {% set pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
+        {% set range_pct = ([(target_range / (current_range / (pct / 100)) * 100) | round(0, 'ceil') | int, 100] | min)
+                           if (target_range > 0 and pct > 0 and current_range > 0) else 0 %}
+        {{ [limit_target, range_pct] | max | int }}
+      attributes:
+        limit_target: >
+          {% set limit = states('input_number.scylla_set_charge_limit') | float(50) %}
+          {% set low = states('input_number.scylla_protection_low') | float(42) %}
+          {% set mid = states('input_number.scylla_protection_mid') | float(47) %}
+          {% set protection = is_state('input_boolean.scylla_battery_protection_enabled', 'on') %}
+          {% set limit_target = (low if limit <= 50 else mid) if (protection and limit <= 51) else limit %}
+          {{ limit_target | int }}
+        range_pct: >
+          {% set target_km = states('input_number.scylla_target_range_km') | float(0) %}
+          {% set target_mi = states('input_number.scylla_target_range_mi') | float(0) %}
+          {% set km = target_km > 0 %}
+          {% set target_range = target_km if km else target_mi %}
+          {% set current_range = states('sensor.scylla_est_battery_range' if km
+                                      else 'sensor.scylla_est_battery_range_mi') | float(0) %}
+          {% set pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
+          {% set range_pct = ([(target_range / (current_range / (pct / 100)) * 100) | round(0, 'ceil') | int, 100] | min)
+                           if (target_range > 0 and pct > 0 and current_range > 0) else 0 %}
+          {{ range_pct }}
+        range_needed_pct: >
+          {% set target_km = states('input_number.scylla_target_range_km') | float(0) %}
+          {% set target_mi = states('input_number.scylla_target_range_mi') | float(0) %}
+          {% set km = target_km > 0 %}
+          {% set target_range = target_km if km else target_mi %}
+          {% set current_range = states('sensor.scylla_est_battery_range' if km
+                                      else 'sensor.scylla_est_battery_range_mi') | float(0) %}
+          {% set pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
+          {{ ((target_range / (current_range / (pct / 100)) * 100) | round(0, 'ceil') | int)
+             if (target_range > 0 and pct > 0 and current_range > 0) else 0 }}
+        protection_only: >
+          {% set limit = states('input_number.scylla_set_charge_limit') | float(50) %}
+          {% set low = states('input_number.scylla_protection_low') | float(42) %}
+          {% set mid = states('input_number.scylla_protection_mid') | float(47) %}
+          {% set protection = is_state('input_boolean.scylla_battery_protection_enabled', 'on') %}
+          {% set limit_target = (low if limit <= 50 else mid) if (protection and limit <= 51) else limit %}
+          {% set target_km = states('input_number.scylla_target_range_km') | float(0) %}
+          {% set target_mi = states('input_number.scylla_target_range_mi') | float(0) %}
+          {% set km = target_km > 0 %}
+          {% set target_range = target_km if km else target_mi %}
+          {% set current_range = states('sensor.scylla_est_battery_range' if km
+                                      else 'sensor.scylla_est_battery_range_mi') | float(0) %}
+          {% set pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
+          {% set range_pct = ([(target_range / (current_range / (pct / 100)) * 100) | round(0, 'ceil') | int, 100] | min)
+                           if (target_range > 0 and pct > 0 and current_range > 0) else 0 %}
+          {{ protection and limit <= 51 and range_pct <= limit_target }}
 
-    # Estimated charge time based on selected speed and actual target
+    # Estimated time to reach the target from the current %, using the
+    # minutes-per-% sensor above (same formula as the scheduler).
     - name: "Scylla Charge Time"
       unique_id: scylla_charge_time
       state: >
         {% set current_pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
-        {% set charge_target_pct = states('sensor.scylla_charge_target_pct') | float(0) %}
-        {% set protection_low = states('input_number.scylla_protection_low') | float(42) %}
-        {% set amps = states('sensor.scylla_charging_amps') | float(27) %}
-        {% set capacity = states('input_number.scylla_battery_capacity_kwh') | float(75) %}
-        {% set speed_raw = states('input_select.scylla_charging_speed') %}
-        {% set speed = 'Fast' if speed_raw == 'Fast' else 'Slow' %}
-        {% set slow_v = states('input_number.scylla_slow_voltage') | float(120) %}
-        {% set fast_v = states('input_number.scylla_fast_voltage') | float(240) %}
-        {% set live_voltage = states('sensor.scylla_charger_voltage') | float(0) %}
-        {% set voltage = live_voltage if live_voltage > 75 else (fast_v if speed == 'Fast' else slow_v) %}
-        {% set charge_pct_needed = [charge_target_pct - current_pct, 0] | max %}
-        {% if charge_pct_needed <= 0 %}
+        {% set target = states('sensor.scylla_charge_target_pct') | float(0) %}
+        {% set min_per_pct = states('sensor.scylla_charger_1percent_increase_time') | float(0) %}
+        {% set needed = [target - current_pct, 0] | max %}
+        {% if needed <= 0 %}
           Already at target
-        {% elif amps > 0 and voltage > 0 %}
-          {% set min_per_pct = ((capacity * 1000 * 0.01) / (voltage * amps) * 60) %}
-          {% set total_minutes = (charge_pct_needed * min_per_pct) | round(0) | int %}
-          {% set h = total_minutes // 60 %}
-          {% set m = total_minutes % 60 %}
-          {{ h }}h {{ m }}min
+        {% elif min_per_pct > 0 %}
+          {% set total = (needed * min_per_pct) | round(0, 'ceil') | int %}
+          {{ total // 60 }}h {{ total % 60 }}min
         {% else %}
           unknown
         {% endif %}
 
-    # Scheduled charge start time based on selected speed and actual target
+    # When the scheduler will start charging. It reads the plan the scheduler
+    # stored in input_datetime.scylla_planned_charge_start, so the dashboard
+    # always shows what will really happen (no separate calculation).
+    #   "Charging"     the car is charging now
+    #   "HH:MM"        planned start today
+    #   "Sat 01:35"    planned start on another day
+    #   "Not needed"   nothing planned (target reached, protection only, or
+    #                  away from your charging locations)
     - name: "Scylla Charge Start At"
       unique_id: scylla_charge_start_at
+      icon: mdi:clock-start
       state: >
-        {% set current_pct = states('sensor.scylla_usable_battery_level_safe') | float(0) %}
-        {% set charge_target_pct = states('sensor.scylla_charge_target_pct') | float(0) %}
-        {% set protection_low = states('input_number.scylla_protection_low') | float(42) %}
-        {% set amps = states('sensor.scylla_charging_amps') | float(27) %}
-        {% set capacity = states('input_number.scylla_battery_capacity_kwh') | float(75) %}
-        {% set speed_raw = states('input_select.scylla_charging_speed') %}
-        {% set speed = 'Fast' if speed_raw == 'Fast' else 'Slow' %}
-        {% set slow_v = states('input_number.scylla_slow_voltage') | float(120) %}
-        {% set fast_v = states('input_number.scylla_fast_voltage') | float(240) %}
-        {% set live_voltage = states('sensor.scylla_charger_voltage') | float(0) %}
-        {% set voltage = live_voltage if live_voltage > 75 else (fast_v if speed == 'Fast' else slow_v) %}
-        {% set charge_pct_needed = [charge_target_pct - current_pct, 0] | max %}
-        {% set departure = states('input_datetime.scylla_departure_time') %}
-        {% set t = departure.split(':') %}
-        {% set dep_seconds = t[0]|int * 3600 + t[1]|int * 60 %}
-        {% if charge_pct_needed <= 0 %}
-          No charge needed
-        {% elif is_state('input_boolean.scylla_battery_protection_enabled', 'on') and current_pct < protection_low %}
-          Now
-        {% elif amps > 0 and voltage > 0 %}
-          {% set min_per_pct = ((capacity * 1000 * 0.01) / (voltage * amps) * 60) %}
-          {% set total_minutes = (charge_pct_needed * min_per_pct) | round(0) | int %}
-          {% set start_seconds = dep_seconds - total_minutes * 60 %}
-          {% set start_seconds = start_seconds if start_seconds >= 0 else start_seconds + 86400 %}
-          {% set sh = (start_seconds // 3600) % 24 %}
-          {% set sm = (start_seconds % 3600) // 60 %}
-          {{ '%02d:%02d' | format(sh, sm) }}
+        {% set plan = state_attr('input_datetime.scylla_planned_charge_start', 'timestamp') | float(0) %}
+        {% if states('sensor.scylla_charging_state') | lower in ['charging', 'starting'] %}
+          Charging
+        {% elif plan > as_timestamp(now()) %}
+          {% if plan | timestamp_custom('%Y-%m-%d') == now().strftime('%Y-%m-%d') %}
+            {{ plan | timestamp_custom('%H:%M') }}
+          {% else %}
+            {{ plan | timestamp_custom('%a %H:%M') }}
+          {% endif %}
         {% else %}
-          unknown
+          Not needed
         {% endif %}
 
     - name: Scylla Charging State UI

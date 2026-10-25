@@ -1,54 +1,78 @@
-# Target range in km (set to 0 to use target % instead)
+# ═════════════════════════════════════════════════════════════════════════════
+# Scylla - input_number helpers
+#
+# About `initial:` — a helper WITH `initial:` is reset to that value at every
+# Home Assistant restart, wiping whatever you set in the UI. A helper WITHOUT
+# it keeps its last value across restarts (a brand-new helper starts at its
+# `min`). So only values the automations rewrite themselves keep an
+# `initial:`; everything you tune by hand has none. After a first install, set
+# those once in Settings → Devices & services → Helpers (see README → Setup).
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Target range in km (0 = none). A MINIMUM range for the next departure:
+# sensor.scylla_charge_target_pct converts it to the % it needs (from the
+# car's current range per %) and the target becomes the higher of that and
+# the target % slider. It never lowers the slider: 55% with 30 km stays 55%.
+# Cleared when the car leaves a charging location or when the limit is
+# changed on the car.
+# No `initial:` — a range you set survives an HA restart.
 scylla_target_range_km:
   name: "Scylla target range"
   min: 0
   max: 700
   step: 10
-  initial: 0
   unit_of_measurement: "km"
   icon: mdi:map-marker-distance
 
-# Target range in mi (set to 0 to use target % instead)
+# Same as above, in miles (dashboard ui-mi.yaml)
 scylla_target_range_mi:
   name: "Scylla target range"
   min: 0
   max: 450
   step: 5
-  initial: 0
   unit_of_measurement: "mi"
   icon: mdi:map-marker-distance
 
-# Battery capacity — update if your car differs from 75 kWh
+# Usable battery capacity, used for every charge-time estimate.
+# Model 3 LR ≈ 75 kWh (a degraded pack has less — lower it if charges keep
+# finishing early). No `initial:` — set it once after install.
 scylla_battery_capacity_kwh:
   name: "Scylla battery capacity (kWh)"
   min: 40
   max: 120
   step: 0.5
-  initial: 75
   unit_of_measurement: "kWh"
   icon: mdi:battery
 
-# Auto-set by automation when car is plugged in based on GPS country
+# Voltage of a "Slow" (wall outlet) charge. Set by the scheduler at each
+# plug-in from the GPS country (sensor.ev_voltage_map): 120 V in North
+# America, 100 V in Japan. Range 100-120: nothing exists between 120 V and
+# 200 V. No `initial:` so the detected value survives a restart.
 scylla_slow_voltage:
   name: "EV slow charging voltage"
   min: 100
   max: 120
   step: 1
-  initial: 120
   unit_of_measurement: "V"
   icon: mdi:lightning-bolt
 
-# Auto-set by automation when car is plugged in based on GPS country
+# Voltage of a "Fast" (wall connector / 240 V) charge. Set at each plug-in
+# from the GPS country: 240 V in North America, 230 V single-phase or 400 V
+# three-phase in Europe. 380 V and up is treated as three-phase (power × √3).
+# No `initial:` so the detected value survives a restart.
 scylla_fast_voltage:
   name: "EV fast charging voltage"
   min: 200
   max: 400
   step: 1
-  initial: 240
   unit_of_measurement: "V"
   icon: mdi:lightning-bolt-circle
 
-# Battery protection thresholds — auto-set by blueprint at first run
+# Battery protection caps. The scheduler writes them on every run from its
+# protection_limit_low_pct / protection_limit_mid_pct variables, so change the
+# variables, not these. `initial:` is fine here (they're rewritten anyway).
+#   low: target 50% → keep the battery at about 40-42%
+#   mid: target 51% → keep the battery at about 45-47%
 scylla_protection_low:
   name: "Scylla protection cap low (≤50%)"
   min: 30
@@ -73,16 +97,22 @@ scylla_protection_mid:
 # looks like "dropped below cap" and immediately restarts charging. Resume
 # threshold = protection_low - this gap. Floor of 2 enforced since real-world
 # settling runs close to 1%; a 1% gap would recreate the exact same problem.
+# No `initial:` — a new helper starts at its min (2), and a value you tune
+# survives restarts.
 scylla_protection_hysteresis:
   name: "Scylla protection hysteresis"
   min: 2
   max: 10
   step: 1
-  initial: 2
   unit_of_measurement: "%"
   icon: mdi:swap-vertical-bold
 
-# Persistent set charge limit — always available, survives restarts
+# The target % you want (the "charge limit" on the dashboard). HA's own copy,
+# always available even while the car sleeps. The scheduler sends it to the
+# car when a charge starts; a limit changed on the car is copied back here.
+# 50 = battery protection only (42%), 51 = protection at 47%.
+# Reset to the default (50) when the car leaves a charging location.
+# No `initial:` so it survives restarts.
 scylla_set_charge_limit:
   name: "Scylla set charge limit"
   min: 50
@@ -91,7 +121,10 @@ scylla_set_charge_limit:
   unit_of_measurement: "%"
   icon: mdi:battery-charging
 
-# Persistent set charging amps — always available, survives restarts
+# Amps for the next charge. Set to the location's default on arrival (helper
+# location_amps), lowered by the Slow speeds, sent to the car when it's
+# awake and when a charge starts. Tesla doesn't accept less than 5 A; 48 A is
+# the onboard charger's maximum. No `initial:` so it survives restarts.
 scylla_set_charging_amps:
   name: "Scylla set charging amps"
   min: 5
@@ -105,12 +138,13 @@ scylla_set_charging_amps:
 # UI. 48A is the Tesla onboard AC charger's hard physical ceiling (Model 3
 # and most current models) — nothing above that is ever real, regardless of
 # location or charger type.
+# No `initial:` — set it once after install (40 A suits a 48 A charger
+# limited to 40 A; use your charger's maximum).
 scylla_amps_sanity_max:
   name: "Scylla amps sanity max"
   min: 10
   max: 48
   step: 1
-  initial: 40
   unit_of_measurement: "A"
   icon: mdi:alert-decagram-outline
 
@@ -124,15 +158,47 @@ scylla_last_known_battery:
   unit_of_measurement: "%"
   icon: mdi:battery-clock
 
-# Amps restored on arrival at home and after each session reset
+# Default amps of the charging location the car is at. The helper sets it on
+# arrival from its location_amps variable (home: 27); choosing "Fast" on the
+# speed selector restores it. No `initial:` (the helper writes it).
 scylla_default_charging_amps:
   name: "Scylla default charging amps"
   min: 5
   max: 48
   step: 1
-  initial: 27
   unit_of_measurement: "A"
   icon: mdi:current-ac
+
+# Charging efficiency: the share of the wall power that gets past the
+# charger, cable and battery heat. It applies to every speed. Start at 94.
+# Together with scylla_charge_overhead_w it gives the power that really
+# reaches the battery:
+#     watts = volts × amps × phase factor × efficiency − overhead
+# Used by the scheduler and the dashboard to time charges.
+# Tune it from real charges: if every charge finishes late, lower it; early,
+# raise it. No `initial:` — set it once after install.
+scylla_charge_efficiency:
+  name: "Scylla charging efficiency"
+  min: 70
+  max: 100
+  step: 1
+  unit_of_measurement: "%"
+  icon: mdi:transmission-tower-export
+
+# Fixed power the car uses for itself while it charges (computer, pumps,
+# cooling), in watts. Unlike the efficiency it does NOT grow with the charging
+# power, so it costs a slow charge much more than a fast one. This is what
+# makes a 120 V charge only ~75-80% efficient while a 240 V charge is ~90%.
+# Start at 250 W. If SLOW charges finish late (not fast ones), raise it; early,
+# lower it. 0 = off (the efficiency alone is used, like the earlier version).
+# No `initial:` — a new helper starts at 0, set it once after install.
+scylla_charge_overhead_w:
+  name: "Scylla charging overhead (W)"
+  min: 0
+  max: 1000
+  step: 10
+  unit_of_measurement: "W"
+  icon: mdi:power-plug-battery-outline
 
 # Scylla climate target temperature
 scylla_climate_target_temp:

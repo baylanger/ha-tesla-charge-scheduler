@@ -1,24 +1,58 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# Scylla - REST sensors (country code for the voltage, weather at the car)
+#
+# Both URLs use the car's GPS position. While the car has no position
+# (TeslaMate not connected yet, HA just started) the URL falls back to the
+# coordinates of your HA home zone, so it is always a valid address instead of
+# "lat=None", and the sensors keep their previous value (see value_template).
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Country code (used to pick the slow/fast voltage when you plug in) ───────
 - resource_template: >
-    https://nominatim.openstreetmap.org/reverse?format=json&lat={{ state_attr('device_tracker.scylla_location', 'latitude') }}&lon={{ state_attr('device_tracker.scylla_location', 'longitude') }}
+    {% set lat = state_attr('device_tracker.scylla_location', 'latitude') %}
+    {% set lon = state_attr('device_tracker.scylla_location', 'longitude') %}
+    {% if lat is none or lon is none %}
+      {% set lat = state_attr('zone.home', 'latitude') %}
+      {% set lon = state_attr('zone.home', 'longitude') %}
+    {% endif %}
+    https://nominatim.openstreetmap.org/reverse?format=json&lat={{ lat }}&lon={{ lon }}
   scan_interval: 1800
+  # Nominatim's usage policy requires an identifying User-Agent with a way to
+  # contact you, and may block the generic "HomeAssistant". Put your own
+  # contact here.
   headers:
-    User-Agent: "HomeAssistant"
+    User-Agent: "HomeAssistant-Scylla (peter.bell@gmail.com)"
   sensor:
     - name: Scylla Location Country Code
+      # No country in the answer (or no GPS position for the car) → keep the
+      # last value.
       value_template: >
-        {% set country = value_json.get('address', {}).get('country_code') %}
+        {% set has_gps = state_attr('device_tracker.scylla_location', 'latitude') is not none
+                         and state_attr('device_tracker.scylla_location', 'longitude') is not none %}
+        {% set country = value_json.get('address', {}).get('country_code') if has_gps else none %}
         {{ country | upper if country else this.state }}
 
+# ── Outside temperature at the car (climate suggestions, optional) ───────────
 - resource_template: >
-    https://api.open-meteo.com/v1/forecast?latitude={{ state_attr('device_tracker.scylla_location', 'latitude') }}&longitude={{ state_attr('device_tracker.scylla_location', 'longitude') }}&current=temperature_2m&temperature_unit=celsius
+    {% set lat = state_attr('device_tracker.scylla_location', 'latitude') %}
+    {% set lon = state_attr('device_tracker.scylla_location', 'longitude') %}
+    {% if lat is none or lon is none %}
+      {% set lat = state_attr('zone.home', 'latitude') %}
+      {% set lon = state_attr('zone.home', 'longitude') %}
+    {% endif %}
+    https://api.open-meteo.com/v1/forecast?latitude={{ lat }}&longitude={{ lon }}&current=temperature_2m&temperature_unit=celsius
   scan_interval: 1800
   headers:
     User-Agent: "HomeAssistant"
   sensor:
     - name: Scylla Location Weather Temp
       unique_id: scylla_location_weather_temp
+      # No GPS position for the car → keep the last value (the answer would be
+      # the temperature at home, not at the car).
       value_template: >
-        {% set temp = value_json.get('current', {}).get('temperature_2m') %}
+        {% set has_gps = state_attr('device_tracker.scylla_location', 'latitude') is not none
+                         and state_attr('device_tracker.scylla_location', 'longitude') is not none %}
+        {% set temp = value_json.get('current', {}).get('temperature_2m') if has_gps else none %}
         {% if temp is not none %}
           {{ temp }}
         {% elif this.state is defined and this.state | is_number %}

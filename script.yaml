@@ -1,0 +1,116 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# Scylla - Start Charge
+#
+# Called by the scheduler (script.turn_on, so the scheduler never waits for
+# it). Living in a script means a new scheduler trigger can't cancel a start
+# halfway, and a failed start is always reported.
+#
+# Add to configuration.yaml:   script: !include script.yaml
+# (If you already have a scripts.yaml from the UI, paste this block into it
+#  instead — HA allows only one `script:` include.)
+# ═════════════════════════════════════════════════════════════════════════════
+scylla_start_charge:
+  alias: Scylla - Start Charge
+  description: >
+    Sets the car's charge limit and amps, turns charging on and checks that the
+    car really started. Used by the Smart Charge Scheduler.
+  icon: mdi:ev-station
+  # A second call while one is running is ignored silently (the scheduler may
+  # re-plan several times in a few seconds).
+  mode: single
+  max_exceeded: silent
+  fields:
+    target_pct:
+      description: Battery % this charge should reach
+      example: 80
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"
+    protection_run:
+      description: >
+        true = battery-protection charge (target_pct is the 42% / 47% cap). The
+        protection-run flag is turned on and the helper stops the charge at the cap.
+      example: false
+      selector:
+        boolean:
+  variables:
+    # Must match notification_target in the scheduler and the helper
+    notification_target: notify.notify
+    # The car refuses a charge limit below 50%; protection charges below 50%
+    # are stopped by the helper instead.
+    car_limit: "{{ [target_pct | int(50), 50] | max }}"
+    amps: "{{ states('input_number.scylla_set_charging_amps') | int(0) }}"
+  sequence:
+    # ── 1. Protection-run flag ──────────────────────────────────────────────
+    # Set BEFORE the charge starts, so the scheduler's "charging started"
+    # run already sees it and the helper knows where to stop.
+    - alias: Set or clear the protection-run flag
+      action: "input_boolean.turn_{{ 'on' if protection_run | default(false) else 'off' }}"
+      target:
+        entity_id: input_boolean.scylla_protection_charge_active
+
+    # ── 2. Charge limit on the car ──────────────────────────────────────────
+    # The target, or 50% for a protection charge (the car's minimum). Even if
+    # HA went down mid-charge, the car would stop at 50%, not at an old 80%.
+    - alias: Push the charge limit to the car
+      if:
+        - condition: template
+          value_template: >
+            {{ states('sensor.scylla_charge_limit_soc') | int(0) != car_limit | int }}
+      then:
+        - action: number.set_value
+          target:
+            entity_id: number.scylla_charge_limit
+          data:
+            value: "{{ car_limit }}"
+          # A sleeping car can make this fail; the charge must still start.
+          continue_on_error: true
+
+    # ── 3. Amps on the car ──────────────────────────────────────────────────
+    # The car remembers amps per location (it may restore 32 A at home);
+    # always use the HA value.
+    - alias: Push the amps to the car
+      if:
+        - condition: template
+          value_template: >
+            {{ amps >= 5
+               and states('number.scylla_charging_amps') | int(0) != amps | int }}
+      then:
+        - action: number.set_value
+          target:
+            entity_id: number.scylla_charging_amps
+          data:
+            value: "{{ amps }}"
+          continue_on_error: true
+
+    # ── 4. Start ────────────────────────────────────────────────────────────
+    - alias: Turn charging on
+      action: switch.turn_on
+      target:
+        entity_id: switch.scylla_charger
+      continue_on_error: true
+
+    # ── 5. Check that it really started (up to 5 minutes) ───────────────────
+    - alias: Wait for the car to report Charging
+      wait_template: >
+        {{ states('sensor.scylla_charging_state') | lower in ['charging', 'starting'] }}
+      timeout: '00:05:00'
+      continue_on_timeout: true
+
+    - alias: Didn't start → tell you and clear the flag
+      if:
+        - condition: template
+          value_template: "{{ not wait.completed }}"
+      then:
+        - action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.scylla_protection_charge_active
+        - action: "{{ notification_target }}"
+          data:
+            message: >
+              ⚠️ Scylla didn't start charging (state:
+              {{ states('sensor.scylla_charging_state') }}, battery
+              {{ states('sensor.scylla_usable_battery_level_safe') | int(0) }}%).
+              Check the cable, the charger and the breaker.
