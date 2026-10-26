@@ -47,13 +47,13 @@ cards:
       - entity: input_number.scylla_set_charge_limit
         name: Set target %
         mode: box
-      - entity: sensor.scylla_effective_range
-        name: Current range (km)
+      - entity: sensor.scylla_rated_battery_range
+        name: Rated range (km)
       - entity: input_number.scylla_target_range_km
         name: Set target range (km)
         mode: box
       - entity: sensor.scylla_charging_amps
-        name: Amperage setting (car)
+        name: Charging amps (live / planned)
       - entity: input_number.scylla_set_charging_amps
         name: Set amperage
         mode: box

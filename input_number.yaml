@@ -200,13 +200,14 @@ scylla_charge_overhead_w:
   unit_of_measurement: "W"
   icon: mdi:power-plug-battery-outline
 
-# Rated range → real range. Tesla firmware 2026.14.x no longer sends the
-# ESTIMATED range (TeslaMate issue #5298), so sensor.scylla_effective_range
-# falls back to the RATED range × this factor. The rated range is higher than
-# what you really get (cold, highway): 85 means "a rated 560 km is ~476 km for
-# me". Tune it from experience: if the car arrives with less range than your
-# target, lower it; with a lot more, raise it. Too low is the safe side (it
-# charges more). Not used while the car still reports the estimated range.
+# Rated range → real range. The target range (km / mi) is converted to a
+# battery % with the car's RATED range (sensor.scylla_rated_battery_range) ×
+# this factor, because the car no longer reports the estimated range (Tesla
+# firmware 2026.14.x, TeslaMate issue #5298). The rated range is higher than
+# what you really get (cold, highway): 85 means "a rated 230 km is ~195 km for
+# me". 100 = use the rated range as it is. Tune it from experience: if the car
+# arrives with less range than your target, lower it; with a lot more, raise
+# it. Too low is the safe side (it charges more).
 # No `initial:` — a new helper starts at 50, so set it (85) once after install.
 scylla_rated_range_factor:
   name: "Scylla rated range factor"
